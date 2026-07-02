@@ -5,10 +5,9 @@ const csv = require('csv-parser');
 const path = require('path');
 
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 
-app.use(cors({ origin: 'https://your-vercel-app.vercel.app' }));
-
+app.use(cors()); // Allow all origins — restrict to Vercel URL after deployment
 
 const csvFilePath = path.join(__dirname, '../../merged_dashboard_data.csv');
 
@@ -18,7 +17,6 @@ app.get('/api/data', (req, res) => {
   fs.createReadStream(csvFilePath)
     .pipe(csv())
     .on('data', (data) => {
-      // Clean up fields if needed
       results.push({
         date: data.POSTING_DATE_KEY,
         movementType: data.MOVEMENT_TYPE,
@@ -28,15 +26,8 @@ app.get('/api/data', (req, res) => {
         material: data.MATERIAL_KEY
       });
     })
-    .on('end', () => {
-      // Send the raw data, frontend will aggregate it for interactive charts
-      res.json(results);
-    })
-    .on('error', (error) => {
-      res.status(500).json({ error: 'Failed to read data' });
-    });
+    .on('end', () => res.json(results))
+    .on('error', (err) => res.status(500).json({ error: 'Failed to read data' }));
 });
 
-app.listen(PORT, () => {
-  console.log(`Backend server running on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));

@@ -38,7 +38,7 @@ function Dashboard() {
   const [filterDateRange, setFilterDateRange] = useState('All');
 
   useEffect(() => {
-    axios.get('http://localhost:3001/api/data', 'https://your-app.onrender.com/api/data')
+    axios.get(import.meta.env.VITE_API_URL ? import.meta.env.VITE_API_URL + '/api/data' : 'http://localhost:3001/api/data')
       .then(res => {
         // Normalize city names: RAIGARH -> Raigarh
         const normalizedData = res.data.map(d => ({
