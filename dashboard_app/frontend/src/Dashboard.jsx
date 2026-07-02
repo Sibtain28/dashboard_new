@@ -38,7 +38,7 @@ function Dashboard() {
   const [filterDateRange, setFilterDateRange] = useState('All');
 
   useEffect(() => {
-    axios.get('http://localhost:3001/api/data')
+    axios.get('http://localhost:3001/api/data', 'https://your-app.onrender.com/api/data')
       .then(res => {
         // Normalize city names: RAIGARH -> Raigarh
         const normalizedData = res.data.map(d => ({
@@ -121,7 +121,7 @@ function Dashboard() {
   const netKpiTrend = { pct: (Math.abs((totalGen - totalCon) / (totalGen || 1)) * 100).toFixed(1), up: netDiff >= 0 };
 
   const TrendIndicator = ({ trend }) => (
-      <div className={`trend-badge ${trend.up ? 'positive' : 'negative'}`}>
+    <div className={`trend-badge ${trend.up ? 'positive' : 'negative'}`}>
       {trend.up ? <TrendingUp size={12} /> : <TrendingDown size={12} />}
       <span>{Math.abs(trend.pct)}%</span>
     </div>
@@ -194,10 +194,10 @@ function Dashboard() {
           label: (context) => {
             let label = context.dataset.label || '';
             if (label) label += ': ';
-            
+
             const isHorizontal = context.chart.options.indexAxis === 'y';
             const parsedVal = isHorizontal ? context.parsed.x : context.parsed.y;
-            
+
             if (parsedVal !== null) {
               label += formatLargeNumber(parsedVal);
 
@@ -208,7 +208,7 @@ function Dashboard() {
                 const pct = ((parsedVal / total) * 100).toFixed(1);
                 label += ` (${pct}%)`;
               }
-              
+
               // Previous period comparison for Trend Charts
               if (isTrend && context.dataIndex > 0) {
                 const prevVal = dataArray[context.dataIndex - 1];
