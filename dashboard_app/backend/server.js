@@ -7,13 +7,14 @@ const path = require('path');
 const app = express();
 const PORT = 3001;
 
-app.use(cors());
+app.use(cors({ origin: 'https://your-vercel-app.vercel.app' }));
+
 
 const csvFilePath = path.join(__dirname, '../../merged_dashboard_data.csv');
 
 app.get('/api/data', (req, res) => {
   const results = [];
-  
+
   fs.createReadStream(csvFilePath)
     .pipe(csv())
     .on('data', (data) => {
