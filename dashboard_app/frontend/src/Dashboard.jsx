@@ -95,7 +95,7 @@ function Dashboard() {
       const pName = d.plantName || d.plantKey;
       const matchPlant = filterPlant === 'All' || pName === filterPlant;
       const matchCity = filterCity === 'All' || d.city === filterCity;
-      
+
       let matchDate = true;
       if (filterDateRange !== 'All' && latestDateStr) {
         const latestY = parseInt(latestDateStr.slice(0, 4));
@@ -120,7 +120,7 @@ function Dashboard() {
           matchDate = curY === latestY && curM === latestM;
         }
       }
-      
+
       return matchPlant && matchCity && matchDate;
     });
   }, [rawData, filterPlant, filterCity, filterDateRange, latestDateStr]);
@@ -169,19 +169,60 @@ function Dashboard() {
     const [open, setOpen] = useState(false);
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState('');
+    const [loading, setLoading] = useState(false);
 
-    const sendMessage = () => {
-      if (!input.trim()) return;
-      const userMsg = { sender: 'user', text: input.trim() };
-      setMessages(prev => [...prev, userMsg]);
-      const lower = input.toLowerCase();
-      let botReply = 'I am here to help!';
-      if (lower.includes('generation')) botReply = 'Generation involves movement types 101 and 102.';
-      else if (lower.includes('consumption')) botReply = 'Consumption involves movement types 261 and 262.';
-      else if (lower.includes('top plant')) botReply = 'You can view top plants in the KPI section.';
-      else if (lower.includes('region')) botReply = 'Region data is displayed in the regional chart.';
-      setMessages(prev => [...prev, { sender: 'bot', text: botReply }]);
+    const sendMessage = async () => {
+      if (!input.trim() || loading) return;
+      const question = input.trim();
+      const userMsg = { sender: 'user', text: question };
+      const placeholderMsg = { sender: 'bot', text: 'Searching the power plant dataset...' };
+
+      const history = [...messages, userMsg].map((msg) => ({
+        role: msg.sender === 'user' ? 'user' : 'assistant',
+        content: msg.text,
+      }));
+
+      setMessages((prev) => [...prev, userMsg, placeholderMsg]);
       setInput('');
+      setLoading(true);
+
+      try {
+        const response = await fetch('http://localhost:3001/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            question,
+            history,
+          }),
+        });
+
+        const data = await response.json();
+        const botText = data.answer || data.error || 'I could not retrieve an answer right now.';
+        setMessages((prev) => {
+          const current = [...prev];
+          const placeholderIndex = current.findIndex((msg) => msg.sender === 'bot' && msg.text === 'Searching the power plant dataset...');
+          if (placeholderIndex >= 0) {
+            current[placeholderIndex] = { sender: 'bot', text: botText };
+          } else {
+            current.push({ sender: 'bot', text: botText });
+          }
+          return current;
+        });
+      } catch (err) {
+        const errorMessage = 'Sorry, the assistant is unavailable right now.';
+        setMessages((prev) => {
+          const current = [...prev];
+          const placeholderIndex = current.findIndex((msg) => msg.sender === 'bot' && msg.text === 'Searching the power plant dataset...');
+          if (placeholderIndex >= 0) {
+            current[placeholderIndex] = { sender: 'bot', text: errorMessage };
+          } else {
+            current.push({ sender: 'bot', text: errorMessage });
+          }
+          return current;
+        });
+      } finally {
+        setLoading(false);
+      }
     };
 
     return (
@@ -197,8 +238,15 @@ function Dashboard() {
             ))}
           </div>
           <div className="chatbot-input-area">
-            <input type="text" value={input} onChange={e => setInput(e.target.value)} placeholder="Ask something..." />
-            <button onClick={sendMessage}>Send</button>
+            <input
+              type="text"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="Ask something..."
+              onKeyDown={(e) => { if (e.key === 'Enter') sendMessage(); }}
+              disabled={loading}
+            />
+            <button onClick={sendMessage} disabled={loading}>Send</button>
           </div>
         </div>
       </div>
@@ -281,11 +329,11 @@ function Dashboard() {
   // --- Row 1: Table & Dual Trend Chart ---
   const plantStats = useMemo(() => {
     if (!filteredData.length || !latestDateStr) return [];
-    
+
     const latestY = latestDateStr.slice(0, 4);
     const latestM = latestDateStr.slice(4, 6);
     const statsMap = {};
-    
+
     filteredData.forEach(d => {
       const pName = d.plantName || d.plantKey || 'Unknown';
       if (!statsMap[pName]) {
@@ -295,7 +343,7 @@ function Dashboard() {
       const isCon = ['261', '262'].includes(d.movementType);
       const isYesterday = d.date === latestDateStr;
       const isMTD = d.date.startsWith(latestY + latestM);
-      
+
       if (isGen) {
         if (isYesterday) statsMap[pName].genYesterday += d.quantity;
         if (isMTD) statsMap[pName].genMTD += d.quantity;
@@ -305,7 +353,7 @@ function Dashboard() {
         if (isMTD) statsMap[pName].conMTD += d.quantity;
       }
     });
-    
+
     return Object.values(statsMap).sort((a, b) => (b.genMTD + b.conMTD) - (a.genMTD + a.conMTD));
   }, [filteredData, latestDateStr]);
 
@@ -545,23 +593,23 @@ function Dashboard() {
               <thead>
                 <tr>
                   <th>Units (Plant)</th>
-                  <th className="num-col">Gen Yesterday</th>
-                  <th className="num-col">Gen MTD</th>
-                  <th className="num-col">Con Yesterday</th>
-                  <th className="num-col">Con MTD</th>
+                  <th className="num-col">Generation Yesterday</th>
+                  <th className="num-col">Generation MTD</th>
+                  <th className="num-col">Consumption Yesterday</th>
+                  <th className="num-col">Consumption MTD</th>
                 </tr>
               </thead>
               <tbody>
                 {plantStats.length === 0 ? (
-                  <tr><td colSpan="5" style={{textAlign: 'center', padding: '2rem'}}>No data available</td></tr>
+                  <tr><td colSpan="5" style={{ textAlign: 'center', padding: '2rem' }}>No data available</td></tr>
                 ) : (
                   plantStats.map((p, idx) => (
                     <tr key={idx}>
                       <td>{p.name}</td>
-                      <td className="num-col" style={{color: '#34d399'}}>{formatTableNum(p.genYesterday)}</td>
-                      <td className="num-col" style={{color: '#10b981'}}>{formatTableNum(p.genMTD)}</td>
-                      <td className="num-col" style={{color: '#fb7185'}}>{formatTableNum(p.conYesterday)}</td>
-                      <td className="num-col" style={{color: '#f43f5e'}}>{formatTableNum(p.conMTD)}</td>
+                      <td className="num-col" style={{ color: '#34d399' }}>{formatTableNum(p.genYesterday)}</td>
+                      <td className="num-col" style={{ color: '#10b981' }}>{formatTableNum(p.genMTD)}</td>
+                      <td className="num-col" style={{ color: '#fb7185' }}>{formatTableNum(p.conYesterday)}</td>
+                      <td className="num-col" style={{ color: '#f43f5e' }}>{formatTableNum(p.conMTD)}</td>
                     </tr>
                   ))
                 )}
@@ -569,7 +617,7 @@ function Dashboard() {
             </table>
           </div>
         </div>
-        
+
         <div className="chart-card">
           <div className="chart-header">
             <h3 className="chart-title"><Zap size={18} color="#3b82f6" /> Generation vs Consumption Trend</h3>
