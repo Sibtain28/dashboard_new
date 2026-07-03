@@ -66,10 +66,16 @@ function Dashboard() {
   };
 
   const formatLargeNumber = (value) => {
-    if (value >= 1e9) return (value / 1e9).toFixed(2) + 'B';
-    if (value >= 1e6) return (value / 1e6).toFixed(2) + 'M';
-    if (value >= 1e3) return (value / 1e3).toFixed(1) + 'k';
-    return value.toLocaleString();
+    if (value === null || value === undefined) return '0 kWh';
+    if (value >= 1e9) return (value / 1e9).toFixed(2) + 'B kWh';
+    if (value >= 1e6) return (value / 1e6).toFixed(2) + 'M kWh';
+    if (value >= 1e3) return (value / 1e3).toFixed(1) + 'k kWh';
+    return value.toLocaleString() + ' kWh';
+  };
+
+  const formatTableNum = (val) => {
+    if (!val) return '-';
+    return val.toLocaleString();
   };
 
   const truncateString = (str, num) => {
@@ -77,16 +83,47 @@ function Dashboard() {
     return str.slice(0, num) + '...';
   };
 
+  const latestDateStr = useMemo(() => {
+    if (rawData.length === 0) return null;
+    const dates = rawData.map(d => d.date).sort();
+    return dates[dates.length - 1];
+  }, [rawData]);
+
   // Derived filtered data
   const filteredData = useMemo(() => {
     return rawData.filter(d => {
       const pName = d.plantName || d.plantKey;
       const matchPlant = filterPlant === 'All' || pName === filterPlant;
       const matchCity = filterCity === 'All' || d.city === filterCity;
-      // Simplified date range for UI demo (since dataset only has 2 dates usually)
-      return matchPlant && matchCity;
+      
+      let matchDate = true;
+      if (filterDateRange !== 'All' && latestDateStr) {
+        const latestY = parseInt(latestDateStr.slice(0, 4));
+        const latestM = parseInt(latestDateStr.slice(4, 6)) - 1;
+        const latestD = parseInt(latestDateStr.slice(6, 8));
+        const latestDateObj = new Date(latestY, latestM, latestD);
+
+        const curY = parseInt(d.date.slice(0, 4));
+        const curM = parseInt(d.date.slice(4, 6)) - 1;
+        const curD = parseInt(d.date.slice(6, 8));
+        const curDateObj = new Date(curY, curM, curD);
+
+        if (filterDateRange === '7D') {
+          const sevenDaysAgo = new Date(latestDateObj);
+          sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+          matchDate = curDateObj >= sevenDaysAgo && curDateObj <= latestDateObj;
+        } else if (filterDateRange === '30D') {
+          const thirtyDaysAgo = new Date(latestDateObj);
+          thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+          matchDate = curDateObj >= thirtyDaysAgo && curDateObj <= latestDateObj;
+        } else if (filterDateRange === 'Month') {
+          matchDate = curY === latestY && curM === latestM;
+        }
+      }
+      
+      return matchPlant && matchCity && matchDate;
     });
-  }, [rawData, filterPlant, filterCity, filterDateRange]);
+  }, [rawData, filterPlant, filterCity, filterDateRange, latestDateStr]);
 
   const uniquePlants = useMemo(() => [...new Set(rawData.map(d => d.plantName || d.plantKey))].filter(Boolean).sort(), [rawData]);
   const uniqueCities = useMemo(() => [...new Set(rawData.map(d => d.city))].filter(Boolean).sort(), [rawData]);
@@ -241,49 +278,79 @@ function Dashboard() {
     }
   });
 
-  // --- Row 1: Trend Charts ---
-  const processTrendChart = (dataset) => {
-    const grouped = dataset.reduce((acc, curr) => {
-      acc[curr.date] = (acc[curr.date] || 0) + curr.quantity;
-      return acc;
-    }, {});
+  // --- Row 1: Table & Dual Trend Chart ---
+  const plantStats = useMemo(() => {
+    if (!filteredData.length || !latestDateStr) return [];
+    
+    const latestY = latestDateStr.slice(0, 4);
+    const latestM = latestDateStr.slice(4, 6);
+    const statsMap = {};
+    
+    filteredData.forEach(d => {
+      const pName = d.plantName || d.plantKey || 'Unknown';
+      if (!statsMap[pName]) {
+        statsMap[pName] = { name: pName, genYesterday: 0, genMTD: 0, conYesterday: 0, conMTD: 0 };
+      }
+      const isGen = ['101', '102'].includes(d.movementType);
+      const isCon = ['261', '262'].includes(d.movementType);
+      const isYesterday = d.date === latestDateStr;
+      const isMTD = d.date.startsWith(latestY + latestM);
+      
+      if (isGen) {
+        if (isYesterday) statsMap[pName].genYesterday += d.quantity;
+        if (isMTD) statsMap[pName].genMTD += d.quantity;
+      }
+      if (isCon) {
+        if (isYesterday) statsMap[pName].conYesterday += d.quantity;
+        if (isMTD) statsMap[pName].conMTD += d.quantity;
+      }
+    });
+    
+    return Object.values(statsMap).sort((a, b) => (b.genMTD + b.conMTD) - (a.genMTD + a.conMTD));
+  }, [filteredData, latestDateStr]);
+
+  const processDualTrendChart = () => {
+    const grouped = {};
+    filteredData.forEach(d => {
+      if (!grouped[d.date]) grouped[d.date] = { gen: 0, con: 0 };
+      if (['101', '102'].includes(d.movementType)) grouped[d.date].gen += d.quantity;
+      if (['261', '262'].includes(d.movementType)) grouped[d.date].con += d.quantity;
+    });
     const sortedDates = Object.keys(grouped).sort();
     return {
       labels: sortedDates.map(parseDateString),
-      data: sortedDates.map(d => grouped[d])
+      genData: sortedDates.map(d => grouped[d].gen),
+      conData: sortedDates.map(d => grouped[d].con)
     };
   };
 
-  const genTrendChartData = processTrendChart(genData);
-  const genTrendChart = {
-    labels: genTrendChartData.labels,
-    datasets: [{
-      label: 'Generation',
-      data: genTrendChartData.data,
-      borderColor: '#10b981',
-      backgroundColor: 'rgba(16, 185, 129, 0.15)',
-      fill: true,
-      tension: 0.4, // Smoother curves
-      borderWidth: 2,
-      pointRadius: 0, // Hide points unless hovered
-      pointHoverRadius: 6
-    }]
-  };
-
-  const conTrendChartData = processTrendChart(conData);
-  const conTrendChart = {
-    labels: conTrendChartData.labels,
-    datasets: [{
-      label: 'Consumption',
-      data: conTrendChartData.data,
-      borderColor: '#f43f5e',
-      backgroundColor: 'rgba(244, 63, 94, 0.15)',
-      fill: true,
-      tension: 0.4,
-      borderWidth: 2,
-      pointRadius: 0,
-      pointHoverRadius: 6
-    }]
+  const dualTrendData = processDualTrendChart();
+  const dualTrendChart = {
+    labels: dualTrendData.labels,
+    datasets: [
+      {
+        label: 'Generation',
+        data: dualTrendData.genData,
+        borderColor: '#10b981',
+        backgroundColor: 'rgba(16, 185, 129, 0.1)',
+        fill: true,
+        tension: 0.4,
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHoverRadius: 6
+      },
+      {
+        label: 'Consumption',
+        data: dualTrendData.conData,
+        borderColor: '#f43f5e',
+        backgroundColor: 'rgba(244, 63, 94, 0.1)',
+        fill: true,
+        tension: 0.4,
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHoverRadius: 6
+      }
+    ]
   };
 
   // --- Row 2: Top Plants ---
@@ -478,20 +545,50 @@ function Dashboard() {
 
       {/* Comparative Charts Grid */}
       <div className="charts-grid">
-        {/* ROW 1: Trends (Taller) */}
-        <div className="chart-card">
+        {/* ROW 1: Table & Dual Trend */}
+        <div className="chart-card table-card">
           <div className="chart-header">
-            <h3 className="chart-title"><Zap size={18} color="#10b981" /> Generation Trend</h3>
-            <p className="chart-subtitle">Volume over time vs previous period</p>
+            <h3 className="chart-title"><Factory size={18} color="#94a3b8" /> Plant Statistics (kWh)</h3>
+            <p className="chart-subtitle">Generation & Consumption by Plant</p>
           </div>
-          <div className="chart-wrapper trend-wrapper"><Line data={genTrendChart} options={createChartOptions(true)} /></div>
+          <div className="chart-wrapper table-wrapper">
+            <table className="styled-table">
+              <thead>
+                <tr>
+                  <th>Units (Plant)</th>
+                  <th className="num-col">Gen Yesterday</th>
+                  <th className="num-col">Gen MTD</th>
+                  <th className="num-col">Con Yesterday</th>
+                  <th className="num-col">Con MTD</th>
+                </tr>
+              </thead>
+              <tbody>
+                {plantStats.length === 0 ? (
+                  <tr><td colSpan="5" style={{textAlign: 'center', padding: '2rem'}}>No data available</td></tr>
+                ) : (
+                  plantStats.map((p, idx) => (
+                    <tr key={idx}>
+                      <td>{p.name}</td>
+                      <td className="num-col" style={{color: '#34d399'}}>{formatTableNum(p.genYesterday)}</td>
+                      <td className="num-col" style={{color: '#10b981'}}>{formatTableNum(p.genMTD)}</td>
+                      <td className="num-col" style={{color: '#fb7185'}}>{formatTableNum(p.conYesterday)}</td>
+                      <td className="num-col" style={{color: '#f43f5e'}}>{formatTableNum(p.conMTD)}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
+        
         <div className="chart-card">
           <div className="chart-header">
-            <h3 className="chart-title"><Activity size={18} color="#f43f5e" /> Consumption Trend</h3>
-            <p className="chart-subtitle">Volume over time vs previous period</p>
+            <h3 className="chart-title"><Zap size={18} color="#3b82f6" /> Generation vs Consumption Trend</h3>
+            <p className="chart-subtitle">Dual comparison over time</p>
           </div>
-          <div className="chart-wrapper trend-wrapper"><Line data={conTrendChart} options={createChartOptions(true)} /></div>
+          <div className="chart-wrapper trend-wrapper">
+            <Line data={dualTrendChart} options={createChartOptions(true)} />
+          </div>
         </div>
 
         {/* ROW 2 */}

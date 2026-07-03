@@ -176,10 +176,14 @@ body {
 }
 
 .kpi-value {
-  font-size: 2rem;
+  font-size: clamp(1.2rem, 2vw, 2rem);
   font-weight: 700;
   color: var(--text-primary);
   line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
 
 .trend-badge {
@@ -250,6 +254,65 @@ body {
 
 .trend-wrapper {
   height: 450px; /* Increased height for trend charts */
+}
+
+/* Table Styles */
+.table-wrapper {
+  overflow-y: auto;
+  max-height: 450px;
+  width: 100%;
+  padding-right: 0.5rem;
+}
+
+.styled-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  text-align: left;
+}
+
+.styled-table th, .styled-table td {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.styled-table th {
+  background-color: rgba(15, 23, 42, 0.8);
+  color: var(--text-secondary);
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.1);
+}
+
+.styled-table tr:hover {
+  background-color: rgba(255, 255, 255, 0.02);
+}
+
+.styled-table td {
+  color: var(--text-primary);
+}
+
+.styled-table .num-col {
+  text-align: right;
+  font-family: monospace;
+}
+
+/* Scrollbar for table */
+.table-wrapper::-webkit-scrollbar {
+  width: 6px;
+}
+.table-wrapper::-webkit-scrollbar-track {
+  background: rgba(255,255,255,0.02);
+  border-radius: 4px;
+}
+.table-wrapper::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.1);
+  border-radius: 4px;
+}
+.table-wrapper::-webkit-scrollbar-thumb:hover {
+  background: rgba(255,255,255,0.2);
 }
 
 .loading {
