@@ -434,7 +434,7 @@ function Dashboard() {
     }
   };
 
-  // Movement Type: 4 Separate Bars
+  // Movement Type: Summary Table
   const processMovementTypes = () => {
     const totals = { '101': 0, '102': 0, '261': 0, '262': 0 };
     filteredData.forEach(d => {
@@ -446,24 +446,13 @@ function Dashboard() {
   };
 
   const mTypeData = processMovementTypes();
-  const movementChart = {
-    labels: ['101', '102', '261', '262'],
-    datasets: [{
-      label: 'Quantity',
-      data: [mTypeData['101'], mTypeData['102'], mTypeData['261'], mTypeData['262']],
-      backgroundColor: ['#10b981', '#059669', '#f43f5e', '#e11d48'],
-      borderRadius: 4
-    }]
-  };
-
-  const movementOptions = {
-    ...createChartOptions(),
-    scales: {
-      x: { grid: { display: false }, ticks: { color: '#e2e8f0', font: { weight: '500' } } },
-      y: { grid: { color: 'rgba(255, 255, 255, 0.05)' }, ticks: { color: '#94a3b8', callback: formatLargeNumber } }
-    }
-  };
-
+  const mTypeTotal = Object.values(mTypeData).reduce((sum, val) => sum + val, 0);
+  const mTypeRows = [
+    { type: '101', category: 'Generation', qty: mTypeData['101'], color: '#10b981' },
+    { type: '102', category: 'Generation', qty: mTypeData['102'], color: '#10b981' },
+    { type: '261', category: 'Consumption', qty: mTypeData['261'], color: '#f43f5e' },
+    { type: '262', category: 'Consumption', qty: mTypeData['262'], color: '#f43f5e' },
+  ];
   if (loading) {
     return <div className="loading"><RefreshCw className="spinner" size={32} /> Loading Enterprise Dashboard...</div>;
   }
@@ -620,8 +609,29 @@ function Dashboard() {
             <h3 className="chart-title"><ListFilter size={18} color="#94a3b8" /> Movement Type Breakdown</h3>
             <p className="chart-subtitle">Generation (101/102) vs Consumption (261/262)</p>
           </div>
-          <div className="chart-wrapper">
-            <Bar data={movementChart} options={movementOptions} />
+          <div className="chart-wrapper table-wrapper">
+            <table className="styled-table">
+              <thead>
+                <tr>
+                  <th>Movement Type</th>
+                  <th>Category</th>
+                  <th className="num-col">Quantity (kWh)</th>
+                  <th className="num-col">% of Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {mTypeRows.map((row) => (
+                  <tr key={row.type}>
+                    <td style={{ fontWeight: 600 }}>{row.type}</td>
+                    <td style={{ color: row.color, fontWeight: 500 }}>{row.category}</td>
+                    <td className="num-col">{formatTableNum(row.qty)}</td>
+                    <td className="num-col">
+                      {mTypeTotal > 0 ? ((row.qty / mTypeTotal) * 100).toFixed(1) + '%' : '0.0%'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       </div>
