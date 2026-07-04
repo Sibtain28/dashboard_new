@@ -2,13 +2,10 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const dotenv = require('dotenv');
-
-dotenv.config();
-
-const { initStore, queryRelevantDocuments } = require('./documentStore');
-const { generateAnswer } = require('./groqClient');
 const fs = require('fs');
 const csv = require('csv-parser');
+
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -189,82 +186,45 @@ app.get('/api/data', (req, res) => {
 
 app.post('/api/chat', async (req, res) => {
   try {
-    const { question, history = [] } = req.body;
-    if (!question || typeof question !== 'string' || !question.trim()) {
-      return res.status(400).json({ error: 'Question is required.' });
+    const message = req.body?.message ?? req.body?.question ?? '';
+    if (typeof message !== 'string' || !message.trim()) {
+      return res.status(400).json({ error: 'Message is required.' });
     }
 
-    const requestedDate = extractRequestedDate(question);
-    const movementTypeFilter = extractMovementTypeFilter(question);
-    const relevantDocs = await queryRelevantDocuments(question, 5, {
-      date: requestedDate,
-      movementTypes: movementTypeFilter,
+    const ollamaResponse = await fetch('http://localhost:11434/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'llama3.2',
+        prompt: message.trim(),
+        stream: false,
+      }),
     });
 
-    if (requestedDate && relevantDocs.length === 0) {
-      return res.json({
-        answer: `No records were found for ${requestedDate}. The dataset does not contain any data for that date.`,
-        citations: [],
-        retrieved: [],
+    if (!ollamaResponse.ok) {
+      const errorText = await ollamaResponse.text();
+      console.error('Ollama request failed:', ollamaResponse.status, errorText);
+      return res.status(503).json({
+        error: 'Ollama is not available. Please make sure Ollama is running and the llama3.2 model is installed.',
       });
     }
 
-    const citationList = relevantDocs.map((item) => {
-      const rowNumber = item.metadata?.rowNumber || item.metadata?.id || 'unknown';
-      const plant = item.metadata?.plantName || item.metadata?.senderPlantName || 'unknown plant';
-      return `row ${rowNumber} (${plant})`;
-    });
+    const data = await ollamaResponse.json();
+    const responseText = typeof data?.response === 'string' ? data.response.trim() : '';
 
-    const retrievedContext = relevantDocs
-      .map((item, index) => `Reference ${index + 1}:
-${item.document}
-Metadata: ${JSON.stringify(item.metadata)}`)
-      .join('\n\n');
-
-    const historyText = history
-      .map((entry) => `${entry.role === 'user' ? 'User' : 'Assistant'}: ${entry.content}`)
-      .join('\n');
-
-    const filterNotes = [];
-    if (requestedDate) {
-      filterNotes.push(`The user asked about ${formatReadableDate(requestedDate)}. Only use records from that date.`);
-    }
-    if (movementTypeFilter.length) {
-      filterNotes.push(`Use movement types ${movementTypeFilter.join(', ')} for generation-related answers.`);
+    if (!responseText) {
+      return res.status(502).json({ error: 'Ollama returned an empty response.' });
     }
 
-    const prompt = `You are a factual assistant for a power plant dataset. Answer using only the provided context. Do not invent facts. If the answer cannot be found in the context, say that the data does not contain enough information.
-
-${filterNotes.join(' ')}
-
-Context:
-${retrievedContext}
-
-Conversation History:
-${historyText}
-
-Question: ${question}
-
-Answer concisely in one paragraph. Do not mention sources, references, or citations. Use a natural date format such as 4 June 2026 when mentioning dates.`;
-
-    const answer = await generateAnswer(prompt);
-    const cleanAnswer = stripCitationText(answer.trim());
-
-    return res.json({ answer: cleanAnswer, citations: citationList, retrieved: relevantDocs });
+    return res.type('text/plain').send(responseText);
   } catch (error) {
     console.error('Chat handler failure:', error);
-    return res.status(500).json({ error: error.message || 'Failed to process chat request.' });
+    return res.status(503).json({ error: 'Ollama is not available. Please make sure Ollama is running.' });
   }
 });
 
-initStore()
-  .then(() => {
-    console.log('Document store initialized.');app.use((req, res) => {
+app.use((req, res) => {
   res.status(404).json({ error: 'Route not found', path: req.originalUrl });
 });
-    app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
-  })
-  .catch((error) => {
-    console.error('Failed to initialize document store:', error);
-    process.exit(1);
-  });
+
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));

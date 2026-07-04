@@ -179,27 +179,30 @@ function Dashboard() {
       const userMsg = { sender: 'user', text: question };
       const placeholderMsg = { sender: 'bot', text: 'Searching the power plant dataset...' };
 
-      const history = [...messages, userMsg].map((msg) => ({
-        role: msg.sender === 'user' ? 'user' : 'assistant',
-        content: msg.text,
-      }));
-
       setMessages((prev) => [...prev, userMsg, placeholderMsg]);
       setInput('');
       setLoading(true);
 
       try {
-        const response = await fetch('http://localhost:3001/api/chat', {
+        const response = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:3001'}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            question,
-            history,
-          }),
+          body: JSON.stringify({ message: question }),
         });
 
-        const data = await response.json();
-        const botText = data.answer || data.error || 'I could not retrieve an answer right now.';
+        let botText = 'Sorry, the assistant is unavailable right now.';
+        if (response.ok) {
+          botText = await response.text();
+        } else {
+          const errorBody = await response.text();
+          try {
+            const parsed = JSON.parse(errorBody);
+            botText = parsed.error || botText;
+          } catch {
+            botText = errorBody || botText;
+          }
+        }
+
         setMessages((prev) => {
           const current = [...prev];
           const placeholderIndex = current.findIndex((msg) => msg.sender === 'bot' && msg.text === 'Searching the power plant dataset...');
@@ -211,7 +214,7 @@ function Dashboard() {
           return current;
         });
       } catch (err) {
-        const errorMessage = 'Sorry, the assistant is unavailable right now.';
+        const errorMessage = 'Sorry, the assistant is unavailable right now. Please make sure Ollama is running.';
         setMessages((prev) => {
           const current = [...prev];
           const placeholderIndex = current.findIndex((msg) => msg.sender === 'bot' && msg.text === 'Searching the power plant dataset...');
