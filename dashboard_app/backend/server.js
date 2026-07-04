@@ -9,6 +9,8 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const csvFilePath = resolveDataFilePath();
+let dashboardRows = [];
 
 function resolveDataFilePath() {
   const workspaceRoot = path.join(__dirname, '../..');
@@ -56,14 +58,10 @@ function formatReadableDate(dateString) {
   });
 }
 
-function stripCitationText(text) {
-  if (!text) return '';
-
-  return text
-    .replace(/\[(?:Reference|Ref)\s*\d+\]/gi, '')
-    .replace(/\bSources?:.*$/gim, '')
-    .replace(/\bReferences?:.*$/gim, '')
-    .replace(/\n{3,}/g, '\n\n')
+function normalizeText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
     .trim();
 }
 
@@ -151,6 +149,119 @@ function extractMovementTypeFilter(question) {
   return [];
 }
 
+function loadDashboardRows() {
+  return new Promise((resolve, reject) => {
+    const results = [];
+    fs.createReadStream(csvFilePath)
+      .pipe(csv())
+      .on('data', (data) => {
+        const date = (data.POSTING_DATE_KEY || '').trim();
+        const movementType = (data.MOVEMENT_TYPE || '').trim();
+        if (!date || !movementType) return;
+
+        results.push({
+          date,
+          movementType,
+          quantity: parseFloat(data.QUANTITY) || 0,
+          plantName: data.SENDER_PLANT_NAME || '',
+          city: data.SENDER_PLANT_CITY || '',
+          material: data.MATERIAL_KEY || '',
+          senderPlantKey: data.SENDER_PLANT_KEY || '',
+        });
+      })
+      .on('end', () => {
+        dashboardRows = results;
+        resolve(results);
+      })
+      .on('error', reject);
+  });
+}
+
+function getRelevantRows(question, rows) {
+  const normalizedQuestion = question.toLowerCase();
+  const requestedDate = extractRequestedDate(question);
+  const movementTypes = extractMovementTypeFilter(question);
+  const stopWords = new Set(['which', 'what', 'plant', 'plants', 'generated', 'generation', 'power', 'highest', 'lowest', 'top', 'most', 'least', 'on', 'the', 'for', 'at', 'with', 'and', 'was', 'were', 'did', 'from', 'to', 'of', 'a', 'an', 'or', 'in', 'is', 'are', 'show', 'give', 'tell', 'me', 'data', 'rows', 'row', 'trend']);
+  const keywordTerms = normalizedQuestion
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word.length > 2 && !stopWords.has(word));
+
+  const filteredRows = rows.filter((row) => {
+    if (requestedDate && row.date !== requestedDate) return false;
+    if (movementTypes.length && !movementTypes.includes(row.movementType)) return false;
+
+    if (!keywordTerms.length) return true;
+
+    const rowText = normalizeText(`${row.plantName} ${row.city} ${row.material} ${row.movementType} ${row.senderPlantKey}`);
+    const keywordHits = keywordTerms.reduce((sum, term) => sum + (rowText.includes(term) ? 1 : 0), 0);
+    return keywordHits > 0 || requestedDate || movementTypes.length;
+  });
+
+  if (!filteredRows.length) {
+    return [];
+  }
+
+  const isAscending = /lowest|minimum|smallest|least/i.test(normalizedQuestion);
+  const isDescending = /highest|maximum|largest|top|most|peak/i.test(normalizedQuestion);
+
+  const sortedRows = [...filteredRows].sort((a, b) => {
+    if (isAscending) return a.quantity - b.quantity;
+    if (isDescending) return b.quantity - a.quantity;
+    return b.date.localeCompare(a.date) || b.quantity - a.quantity;
+  });
+
+  return sortedRows.slice(0, 8);
+}
+
+function createDirectAnswer(question, rows) {
+  const normalizedQuestion = question.toLowerCase();
+  const requestedDate = extractRequestedDate(question);
+  const generationRows = rows.filter((row) => ['101', '102'].includes(row.movementType) && (!requestedDate || row.date === requestedDate));
+
+  if (!generationRows.length) {
+    return null;
+  }
+
+  const plantMatches = generationRows.filter((row) => {
+    const rowText = normalizeText(`${row.plantName} ${row.senderPlantKey} ${row.city}`);
+    const questionText = normalizeText(question);
+    return rowText.includes(questionText) || questionText.includes(rowText);
+  });
+
+  const candidateRows = plantMatches.length ? plantMatches : generationRows;
+
+  if (/highest|maximum|largest|top|peak/i.test(normalizedQuestion) && /generation|generated|power/i.test(normalizedQuestion) && !/trend/i.test(normalizedQuestion)) {
+    const bestRow = [...candidateRows].sort((a, b) => b.quantity - a.quantity)[0];
+    if (!bestRow) return null;
+    return `${bestRow.plantName} recorded the highest generation${requestedDate ? ` on ${formatReadableDate(requestedDate)}` : ''} with ${bestRow.quantity.toLocaleString()} units.`;
+  }
+
+  if (/trend|history|over time/i.test(normalizedQuestion)) {
+    const plantRow = candidateRows[0];
+    if (!plantRow) return null;
+    const plantName = plantRow.plantName;
+    const trendRows = candidateRows.filter((row) => row.plantName === plantName).sort((a, b) => a.date.localeCompare(b.date));
+    if (!trendRows.length) return null;
+    const points = trendRows.map((row) => `${formatReadableDate(row.date)}: ${row.quantity.toLocaleString()} units`).join('; ');
+    return `The generation trend for ${plantName} is: ${points}.`;
+  }
+
+  if (/generation|generated|power/i.test(normalizedQuestion) && /for|of|about/i.test(normalizedQuestion)) {
+    const plantRow = candidateRows[0];
+    if (!plantRow) return null;
+    const latestRow = [...candidateRows].sort((a, b) => b.date.localeCompare(a.date))[0];
+    return `${latestRow.plantName} recorded generation of ${latestRow.quantity.toLocaleString()} units${requestedDate ? ` on ${formatReadableDate(requestedDate)}` : ` on ${formatReadableDate(latestRow.date)}`}.`;
+  }
+
+  if (/efficient|efficiency/i.test(normalizedQuestion)) {
+    const bestRow = [...candidateRows].sort((a, b) => b.quantity - a.quantity)[0];
+    if (!bestRow) return null;
+    return `The highest generation in the available data was recorded at ${bestRow.plantName} with ${bestRow.quantity.toLocaleString()} units.`;
+  }
+
+  return null;
+}
+
 app.use(cors());
 app.use(express.json());
 
@@ -159,29 +270,12 @@ app.use((req, res, next) => {
   next();
 });
 
-const csvFilePath = resolveDataFilePath();
-
 app.get('/api/ping', (req, res) => {
   return res.json({ status: 'ok', message: 'Backend is running', uptime: process.uptime() });
 });
 
 app.get('/api/data', (req, res) => {
-  const results = [];
-
-  fs.createReadStream(csvFilePath)
-    .pipe(csv())
-    .on('data', (data) => {
-      results.push({
-        date: data.POSTING_DATE_KEY,
-        movementType: data.MOVEMENT_TYPE,
-        quantity: parseFloat(data.QUANTITY) || 0,
-        plantName: data.SENDER_PLANT_NAME,
-        city: data.SENDER_PLANT_CITY,
-        material: data.MATERIAL_KEY
-      });
-    })
-    .on('end', () => res.json(results))
-    .on('error', (err) => res.status(500).json({ error: 'Failed to read data' }));
+  return res.json(dashboardRows);
 });
 
 app.post('/api/chat', async (req, res) => {
@@ -191,12 +285,35 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: 'Message is required.' });
     }
 
+    const directAnswer = createDirectAnswer(message, dashboardRows);
+    if (directAnswer) {
+      return res.type('text/plain').send(directAnswer);
+    }
+
+    const relevantRows = getRelevantRows(message, dashboardRows);
+    if (!relevantRows.length) {
+      return res.type('text/plain').send('The information is unavailable in the provided CSV data.');
+    }
+
+    const contextText = relevantRows.map((row, index) => {
+      const readableDate = formatReadableDate(row.date);
+      return `${index + 1}. Date: ${readableDate} | Movement type: ${row.movementType} | Quantity: ${row.quantity} | Plant: ${row.plantName || 'unknown'} | City: ${row.city || 'unknown'} | Material: ${row.material || 'unknown'}`;
+    }).join('\n');
+
+    const prompt = `You are a factual assistant. Answer ONLY using the CSV rows provided below. Do not use outside knowledge. If the requested information is not present in the provided rows, reply exactly: The information is unavailable in the provided CSV data.
+
+CSV rows:
+${contextText}
+
+Question: ${message}
+Answer in one short sentence.`;
+
     const ollamaResponse = await fetch('http://localhost:11434/api/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'llama3.2',
-        prompt: message.trim(),
+        prompt,
         stream: false,
       }),
     });
@@ -227,4 +344,11 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Route not found', path: req.originalUrl });
 });
 
-app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+loadDashboardRows()
+  .then(() => {
+    app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+  })
+  .catch((error) => {
+    console.error('Failed to load dashboard CSV:', error);
+    process.exit(1);
+  });
