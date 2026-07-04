@@ -118,6 +118,8 @@ function Dashboard() {
           matchDate = curDateObj >= thirtyDaysAgo && curDateObj <= latestDateObj;
         } else if (filterDateRange === 'Month') {
           matchDate = curY === latestY && curM === latestM;
+        } else if (filterDateRange === 'Year') {
+          matchDate = curY === latestY;
         }
       }
 
@@ -326,36 +328,42 @@ function Dashboard() {
     }
   });
 
+  const plantTableConfig = useMemo(() => {
+    switch (filterDateRange) {
+      case '7D':
+        return { generationLabel: 'Generation (7D)', consumptionLabel: 'Consumption (7D)' };
+      case '30D':
+        return { generationLabel: 'Generation (30D)', consumptionLabel: 'Consumption (30D)' };
+      case 'Month':
+        return { generationLabel: 'Generation MTD', consumptionLabel: 'Consumption MTD' };
+      case 'Year':
+        return { generationLabel: 'Generation YTD', consumptionLabel: 'Consumption YTD' };
+      default:
+        return { generationLabel: 'Total Generation', consumptionLabel: 'Total Consumption' };
+    }
+  }, [filterDateRange]);
+
   // --- Row 1: Table & Dual Trend Chart ---
   const plantStats = useMemo(() => {
-    if (!filteredData.length || !latestDateStr) return [];
+    if (!filteredData.length) return [];
 
-    const latestY = latestDateStr.slice(0, 4);
-    const latestM = latestDateStr.slice(4, 6);
     const statsMap = {};
 
     filteredData.forEach(d => {
       const pName = d.plantName || d.plantKey || 'Unknown';
       if (!statsMap[pName]) {
-        statsMap[pName] = { name: pName, genYesterday: 0, genMTD: 0, conYesterday: 0, conMTD: 0 };
+        statsMap[pName] = { name: pName, generation: 0, consumption: 0 };
       }
-      const isGen = ['101', '102'].includes(d.movementType);
-      const isCon = ['261', '262'].includes(d.movementType);
-      const isYesterday = d.date === latestDateStr;
-      const isMTD = d.date.startsWith(latestY + latestM);
-
-      if (isGen) {
-        if (isYesterday) statsMap[pName].genYesterday += d.quantity;
-        if (isMTD) statsMap[pName].genMTD += d.quantity;
+      if (['101', '102'].includes(d.movementType)) {
+        statsMap[pName].generation += d.quantity;
       }
-      if (isCon) {
-        if (isYesterday) statsMap[pName].conYesterday += d.quantity;
-        if (isMTD) statsMap[pName].conMTD += d.quantity;
+      if (['261', '262'].includes(d.movementType)) {
+        statsMap[pName].consumption += d.quantity;
       }
     });
 
-    return Object.values(statsMap).sort((a, b) => (b.genMTD + b.conMTD) - (a.genMTD + a.conMTD));
-  }, [filteredData, latestDateStr]);
+    return Object.values(statsMap).sort((a, b) => (b.generation + b.consumption) - (a.generation + a.consumption));
+  }, [filteredData]);
 
   const processDualTrendChart = () => {
     const grouped = {};
@@ -525,6 +533,7 @@ function Dashboard() {
               <option value="7D">Last 7 Days</option>
               <option value="30D">Last 30 Days</option>
               <option value="Month">This Month</option>
+              <option value="Year">This Year</option>
             </select>
           </div>
           <div className="filter-group">
@@ -593,23 +602,19 @@ function Dashboard() {
               <thead>
                 <tr>
                   <th>Units (Plant)</th>
-                  <th className="num-col">Generation Yesterday</th>
-                  <th className="num-col">Generation MTD</th>
-                  <th className="num-col">Consumption Yesterday</th>
-                  <th className="num-col">Consumption MTD</th>
+                  <th className="num-col">{plantTableConfig.generationLabel}</th>
+                  <th className="num-col">{plantTableConfig.consumptionLabel}</th>
                 </tr>
               </thead>
               <tbody>
                 {plantStats.length === 0 ? (
-                  <tr><td colSpan="5" style={{ textAlign: 'center', padding: '2rem' }}>No data available</td></tr>
+                  <tr><td colSpan="3" style={{ textAlign: 'center', padding: '2rem' }}>No data available</td></tr>
                 ) : (
                   plantStats.map((p, idx) => (
                     <tr key={idx}>
                       <td>{p.name}</td>
-                      <td className="num-col" style={{ color: '#34d399' }}>{formatTableNum(p.genYesterday)}</td>
-                      <td className="num-col" style={{ color: '#10b981' }}>{formatTableNum(p.genMTD)}</td>
-                      <td className="num-col" style={{ color: '#fb7185' }}>{formatTableNum(p.conYesterday)}</td>
-                      <td className="num-col" style={{ color: '#f43f5e' }}>{formatTableNum(p.conMTD)}</td>
+                      <td className="num-col" style={{ color: '#10b981' }}>{formatTableNum(p.generation)}</td>
+                      <td className="num-col" style={{ color: '#f43f5e' }}>{formatTableNum(p.consumption)}</td>
                     </tr>
                   ))
                 )}

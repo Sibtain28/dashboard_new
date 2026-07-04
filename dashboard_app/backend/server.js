@@ -13,11 +13,61 @@ const csv = require('csv-parser');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+function resolveDataFilePath() {
+  const workspaceRoot = path.join(__dirname, '../..');
+  const candidates = [];
+  const mergedPath = path.join(workspaceRoot, 'merged_dashboard_data.csv');
+  if (fs.existsSync(mergedPath)) {
+    candidates.push(mergedPath);
+  }
+
+  const sourceFiles = fs.readdirSync(workspaceRoot)
+    .filter((file) => file.startsWith('FACT_QUALITY_MATERIAL_MOVEMENT_') && file.endsWith('.csv'))
+    .map((file) => path.join(workspaceRoot, file));
+
+  candidates.push(...sourceFiles);
+
+  if (!candidates.length) {
+    return mergedPath;
+  }
+
+  candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  return candidates[0];
+}
+
 function formatDateYYYYMMDD(date) {
   const year = date.getUTCFullYear();
   const month = String(date.getUTCMonth() + 1).padStart(2, '0');
   const day = String(date.getUTCDate()).padStart(2, '0');
   return `${year}${month}${day}`;
+}
+
+function formatReadableDate(dateString) {
+  if (!dateString || !/^\d{8}$/.test(dateString)) {
+    return dateString || '';
+  }
+
+  const year = parseInt(dateString.slice(0, 4), 10);
+  const month = parseInt(dateString.slice(4, 6), 10) - 1;
+  const day = parseInt(dateString.slice(6, 8), 10);
+  const parsedDate = new Date(Date.UTC(year, month, day));
+
+  return parsedDate.toLocaleDateString('en-GB', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+  });
+}
+
+function stripCitationText(text) {
+  if (!text) return '';
+
+  return text
+    .replace(/\[(?:Reference|Ref)\s*\d+\]/gi, '')
+    .replace(/\bSources?:.*$/gim, '')
+    .replace(/\bReferences?:.*$/gim, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function extractRequestedDate(question) {
@@ -32,6 +82,62 @@ function extractRequestedDate(question) {
 
   if (lower.includes('today')) {
     return formatDateYYYYMMDD(now);
+  }
+
+  const monthMap = {
+    january: 0,
+    february: 1,
+    march: 2,
+    april: 3,
+    may: 4,
+    june: 5,
+    july: 6,
+    august: 7,
+    september: 8,
+    october: 9,
+    november: 10,
+    december: 11,
+  };
+
+  const patterns = [
+    /(\d{4})[-/](\d{1,2})[-/](\d{1,2})/,
+    /(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})/i,
+    /(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(\d{4})/i,
+    /(\d{1,2})[-/](\d{1,2})[-/](\d{4})/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = question.match(pattern);
+    if (!match) continue;
+
+    let year;
+    let month;
+    let day;
+
+    if (pattern.source.startsWith('(\\d{4})')) {
+      year = parseInt(match[1], 10);
+      month = parseInt(match[2], 10) - 1;
+      day = parseInt(match[3], 10);
+    } else if (pattern.source.startsWith('(\\d{1,2})(?:st|nd|rd|th)?')) {
+      day = parseInt(match[1], 10);
+      month = monthMap[match[2].toLowerCase()];
+      year = parseInt(match[3], 10);
+    } else if (pattern.source.startsWith('(january')) {
+      month = monthMap[match[1].toLowerCase()];
+      day = parseInt(match[2], 10);
+      year = parseInt(match[3], 10);
+    } else {
+      year = parseInt(match[3], 10);
+      month = parseInt(match[1], 10) - 1;
+      day = parseInt(match[2], 10);
+    }
+
+    if (Number.isNaN(month) || Number.isNaN(day) || Number.isNaN(year)) {
+      continue;
+    }
+
+    const parsedDate = new Date(Date.UTC(year, month, day));
+    return formatDateYYYYMMDD(parsedDate);
   }
 
   return null;
@@ -56,7 +162,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const csvFilePath = path.join(__dirname, '../../merged_dashboard_data.csv');
+const csvFilePath = resolveDataFilePath();
 
 app.get('/api/ping', (req, res) => {
   return res.json({ status: 'ok', message: 'Backend is running', uptime: process.uptime() });
@@ -121,7 +227,7 @@ Metadata: ${JSON.stringify(item.metadata)}`)
 
     const filterNotes = [];
     if (requestedDate) {
-      filterNotes.push(`The user asked about ${requestedDate} (yesterday). Only use records from that date.`);
+      filterNotes.push(`The user asked about ${formatReadableDate(requestedDate)}. Only use records from that date.`);
     }
     if (movementTypeFilter.length) {
       filterNotes.push(`Use movement types ${movementTypeFilter.join(', ')} for generation-related answers.`);
@@ -139,13 +245,12 @@ ${historyText}
 
 Question: ${question}
 
-Answer concisely. Include citations to the relevant records used from the dataset in the answer.`;
+Answer concisely in one paragraph. Do not mention sources, references, or citations. Use a natural date format such as 4 June 2026 when mentioning dates.`;
 
     const answer = await generateAnswer(prompt);
-    const cleanAnswer = answer.trim();
-    const answerWithCitations = `${cleanAnswer}\n\nSources: ${citationList.join(', ')}`;
+    const cleanAnswer = stripCitationText(answer.trim());
 
-    return res.json({ answer: answerWithCitations, citations: citationList, retrieved: relevantDocs });
+    return res.json({ answer: cleanAnswer, citations: citationList, retrieved: relevantDocs });
   } catch (error) {
     console.error('Chat handler failure:', error);
     return res.status(500).json({ error: error.message || 'Failed to process chat request.' });

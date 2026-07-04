@@ -3,8 +3,31 @@ const path = require('path');
 const csv = require('csv-parser');
 const { generateEmbedding, DEFAULT_DIMENSION } = require('./embeddings');
 
-const DATA_PATH = path.join(__dirname, '../../merged_dashboard_data.csv');
 const COLLECTION_NAME = 'power-plant-data';
+
+function resolveDataFilePath() {
+  const workspaceRoot = path.join(__dirname, '../..');
+  const candidates = [];
+  const mergedPath = path.join(workspaceRoot, 'merged_dashboard_data.csv');
+  if (fs.existsSync(mergedPath)) {
+    candidates.push(mergedPath);
+  }
+
+  const sourceFiles = fs.readdirSync(workspaceRoot)
+    .filter((file) => file.startsWith('FACT_QUALITY_MATERIAL_MOVEMENT_') && file.endsWith('.csv'))
+    .map((file) => path.join(workspaceRoot, file));
+
+  candidates.push(...sourceFiles);
+
+  if (!candidates.length) {
+    return mergedPath;
+  }
+
+  candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  return candidates[0];
+}
+
+const DATA_PATH = resolveDataFilePath();
 
 const inMemoryStore = {
   ids: [],
