@@ -213,54 +213,7 @@ function getRelevantRows(question, rows) {
   return sortedRows.slice(0, 8);
 }
 
-function createDirectAnswer(question, rows) {
-  const normalizedQuestion = question.toLowerCase();
-  const requestedDate = extractRequestedDate(question);
-  const generationRows = rows.filter((row) => ['101', '102'].includes(row.movementType) && (!requestedDate || row.date === requestedDate));
-
-  if (!generationRows.length) {
-    return null;
-  }
-
-  const plantMatches = generationRows.filter((row) => {
-    const rowText = normalizeText(`${row.plantName} ${row.senderPlantKey} ${row.city}`);
-    const questionText = normalizeText(question);
-    return rowText.includes(questionText) || questionText.includes(rowText);
-  });
-
-  const candidateRows = plantMatches.length ? plantMatches : generationRows;
-
-  if (/highest|maximum|largest|top|peak/i.test(normalizedQuestion) && /generation|generated|power/i.test(normalizedQuestion) && !/trend/i.test(normalizedQuestion)) {
-    const bestRow = [...candidateRows].sort((a, b) => b.quantity - a.quantity)[0];
-    if (!bestRow) return null;
-    return `${bestRow.plantName} recorded the highest generation${requestedDate ? ` on ${formatReadableDate(requestedDate)}` : ''} with ${bestRow.quantity.toLocaleString()} units.`;
-  }
-
-  if (/trend|history|over time/i.test(normalizedQuestion)) {
-    const plantRow = candidateRows[0];
-    if (!plantRow) return null;
-    const plantName = plantRow.plantName;
-    const trendRows = candidateRows.filter((row) => row.plantName === plantName).sort((a, b) => a.date.localeCompare(b.date));
-    if (!trendRows.length) return null;
-    const points = trendRows.map((row) => `${formatReadableDate(row.date)}: ${row.quantity.toLocaleString()} units`).join('; ');
-    return `The generation trend for ${plantName} is: ${points}.`;
-  }
-
-  if (/generation|generated|power/i.test(normalizedQuestion) && /for|of|about/i.test(normalizedQuestion)) {
-    const plantRow = candidateRows[0];
-    if (!plantRow) return null;
-    const latestRow = [...candidateRows].sort((a, b) => b.date.localeCompare(a.date))[0];
-    return `${latestRow.plantName} recorded generation of ${latestRow.quantity.toLocaleString()} units${requestedDate ? ` on ${formatReadableDate(requestedDate)}` : ` on ${formatReadableDate(latestRow.date)}`}.`;
-  }
-
-  if (/efficient|efficiency/i.test(normalizedQuestion)) {
-    const bestRow = [...candidateRows].sort((a, b) => b.quantity - a.quantity)[0];
-    if (!bestRow) return null;
-    return `The highest generation in the available data was recorded at ${bestRow.plantName} with ${bestRow.quantity.toLocaleString()} units.`;
-  }
-
-  return null;
-}
+// Note: direct-answer shortcut removed — all chat requests go through Ollama RAG now.
 
 app.use(cors());
 app.use(express.json());
@@ -285,15 +238,16 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: 'Message is required.' });
     }
 
-    const directAnswer = createDirectAnswer(message, dashboardRows);
-    if (directAnswer) {
-      return res.type('text/plain').send(directAnswer);
-    }
+    console.log(`\n📝 Chat Request: "${message}"`);
+    console.log('🔄 Delegating to Ollama RAG for all requests');
 
     const relevantRows = getRelevantRows(message, dashboardRows);
     if (!relevantRows.length) {
+      console.log('❌ No relevant rows found in CSV');
       return res.type('text/plain').send('The information is unavailable in the provided CSV data.');
     }
+
+    console.log(`   Found ${relevantRows.length} relevant CSV rows for context`);
 
     const contextText = relevantRows.map((row, index) => {
       const readableDate = formatReadableDate(row.date);
@@ -308,6 +262,7 @@ ${contextText}
 Question: ${message}
 Answer in one short sentence.`;
 
+    console.log('   🤖 Calling Ollama at http://localhost:11434...');
     const ollamaResponse = await fetch('http://localhost:11434/api/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -320,7 +275,7 @@ Answer in one short sentence.`;
 
     if (!ollamaResponse.ok) {
       const errorText = await ollamaResponse.text();
-      console.error('Ollama request failed:', ollamaResponse.status, errorText);
+      console.error('❌ Ollama request failed:', ollamaResponse.status, errorText);
       return res.status(503).json({
         error: 'Ollama is not available. Please make sure Ollama is running and the llama3.2 model is installed.',
       });
@@ -330,12 +285,15 @@ Answer in one short sentence.`;
     const responseText = typeof data?.response === 'string' ? data.response.trim() : '';
 
     if (!responseText) {
+      console.error('❌ Ollama returned empty response');
       return res.status(502).json({ error: 'Ollama returned an empty response.' });
     }
 
+    console.log('✅ [OLLAMA RESPONSE] Received answer from Ollama model (llama3.2)');
+    console.log(`   Response: ${responseText.substring(0, 80)}...`);
     return res.type('text/plain').send(responseText);
   } catch (error) {
-    console.error('Chat handler failure:', error);
+    console.error('❌ Chat handler failure:', error.message);
     return res.status(503).json({ error: 'Ollama is not available. Please make sure Ollama is running.' });
   }
 });
