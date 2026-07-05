@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import axios from 'axios';
 import {
   Chart as ChartJS,
@@ -8,12 +8,27 @@ import {
   LineElement,
   BarElement,
   Title,
-  Tooltip,
+  Tooltip as ChartJSTooltip,
   Legend,
   Filler,
 } from 'chart.js';
 import { Line, Bar } from 'react-chartjs-2';
-import { Activity, Zap, Factory, BarChart3, ListFilter, RefreshCw, Calendar, TrendingUp, TrendingDown, Clock, MessageSquare } from 'lucide-react';
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line as RechartsLine,
+  BarChart,
+  Bar as RechartsBar,
+  PieChart,
+  Pie,
+  Cell,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip as RechartsTooltip,
+  Legend as RechartsLegend,
+} from 'recharts';
+import { Activity, Zap, Factory, BarChart3, ListFilter, RefreshCw, Calendar, TrendingUp, TrendingDown, Clock, MessageSquare, X as CloseIcon } from 'lucide-react';
 
 ChartJS.register(
   CategoryScale,
@@ -22,7 +37,7 @@ ChartJS.register(
   LineElement,
   BarElement,
   Title,
-  Tooltip,
+  ChartJSTooltip,
   Legend,
   Filler
 );
@@ -166,22 +181,130 @@ function Dashboard() {
     </div>
   );
 
-  // AI Chatbot Component
+  const chatBodyRef = useRef(null);
+  const chartColors = ['#10b981', '#f43f5e', '#3b82f6', '#fbbf24', '#8b5cf6'];
+
+  const buildRechartData = (chart) => {
+    if (!chart?.data || !Array.isArray(chart.data.labels) || !Array.isArray(chart.data.datasets)) {
+      return [];
+    }
+
+    if (chart.chartType === 'pie') {
+      const labels = chart.data.labels || [];
+      const values = chart.data.datasets?.[0]?.data || [];
+      return labels.map((label, index) => ({
+        name: label,
+        value: values[index] ?? 0,
+        fill: chart.data.datasets?.[0]?.colors?.[index] || chartColors[index % chartColors.length],
+      }));
+    }
+
+    return chart.data.labels.map((label, index) => {
+      const row = { name: label };
+      chart.data.datasets.forEach((dataset, datasetIndex) => {
+        const key = dataset.label || `Series ${datasetIndex + 1}`;
+        row[key] = dataset.data?.[index] ?? 0;
+        if (dataset.fullLabels) {
+          row[`${key}_fullLabel`] = dataset.fullLabels[index];
+        }
+      });
+      return row;
+    });
+  };
+
+  const renderChartMessage = (chart) => {
+    const payload = buildRechartData(chart);
+    return (
+      <div className="bot-chart-card">
+        <div className="bot-chart-header">
+          <div>
+            <div className="bot-chart-title">{chart.title || 'Chart'}</div>
+            {chart.subtitle ? <div className="bot-chart-subtitle">{chart.subtitle}</div> : null}
+          </div>
+        </div>
+        <div className="bot-chart-wrapper">
+          <ResponsiveContainer width="100%" height={260}>
+            {chart.chartType === 'line' ? (
+              <LineChart data={payload} margin={{ top: 16, right: 16, left: 0, bottom: 8 }}>
+                <CartesianGrid stroke="rgba(15, 23, 42, 0.08)" strokeDasharray="3 3" />
+                <XAxis dataKey="name" tick={{ fill: '#334155', fontSize: 12 }} tickLine={false} axisLine={false} />
+                <YAxis tick={{ fill: '#334155', fontSize: 12 }} tickFormatter={formatLargeNumber} tickLine={false} axisLine={false} />
+                <RechartsTooltip contentStyle={{ backgroundColor: '#f8fafc', border: '1px solid rgba(148, 163, 184, 0.22)', color: '#0f172a' }} formatter={(value) => [formatLargeNumber(value), 'Value']} />
+                <RechartsLegend wrapperStyle={{ color: '#334155' }} />
+                {chart.data.datasets.map((dataset, index) => (
+                  <RechartsLine
+                    key={`${dataset.label}-${index}`}
+                    type="monotone"
+                    dataKey={dataset.label || `Series ${index + 1}`}
+                    stroke={dataset.color || chartColors[index % chartColors.length]}
+                    strokeWidth={2.5}
+                    dot={false}
+                    activeDot={{ r: 6 }}
+                  />
+                ))}
+              </LineChart>
+            ) : chart.chartType === 'bar' ? (
+              <BarChart data={payload} margin={{ top: 16, right: 16, left: 0, bottom: 8 }}>
+                <CartesianGrid stroke="rgba(15, 23, 42, 0.08)" strokeDasharray="3 3" />
+                <XAxis dataKey="name" tick={{ fill: '#334155', fontSize: 12 }} tickLine={false} axisLine={false} />
+                <YAxis tick={{ fill: '#334155', fontSize: 12 }} tickFormatter={formatLargeNumber} tickLine={false} axisLine={false} />
+                <RechartsTooltip contentStyle={{ backgroundColor: '#f8fafc', border: '1px solid rgba(148, 163, 184, 0.22)', color: '#0f172a' }} formatter={(value) => [formatLargeNumber(value), 'Value']} />
+                <RechartsLegend wrapperStyle={{ color: '#334155' }} />
+                {chart.data.datasets.map((dataset, index) => (
+                  <RechartsBar
+                    key={`${dataset.label}-${index}`}
+                    dataKey={dataset.label || `Series ${index + 1}`}
+                    fill={dataset.color || chartColors[index % chartColors.length]}
+                    radius={[8, 8, 0, 0]}
+                  />
+                ))}
+              </BarChart>
+            ) : (
+              <PieChart>
+                <RechartsTooltip contentStyle={{ backgroundColor: '#f8fafc', border: '1px solid rgba(148, 163, 184, 0.22)', color: '#0f172a' }} formatter={(value) => [formatLargeNumber(value), 'Value']} />
+                <Pie data={payload} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={100} innerRadius={48} paddingAngle={4}>
+                  {payload.map((entry, index) => (
+                    <Cell key={`cell-${index}`} fill={entry.fill || chartColors[index % chartColors.length]} />
+                  ))}
+                </Pie>
+              </PieChart>
+            )}
+          </ResponsiveContainer>
+        </div>
+      </div>
+    );
+  };
+
+  const detectChartIntentFrontend = (question) => {
+    const lower = String(question || '').toLowerCase();
+    return /trend|compare|comparison|visual|chart|graph|plot|show.*trend|versus|\svs\s|compare/i.test(lower);
+  };
+
   const Chatbot = () => {
     const [open, setOpen] = useState(false);
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState('');
-    const [loading, setLoading] = useState(false);
+    const [loadingChat, setLoadingChat] = useState(false);
+
+    useEffect(() => {
+      if (!open || !chatBodyRef.current) return;
+      chatBodyRef.current.scrollTop = chatBodyRef.current.scrollHeight;
+    }, [messages, open]);
 
     const sendMessage = async () => {
-      if (!input.trim() || loading) return;
+      if (!input.trim() || loadingChat) return;
       const question = input.trim();
-      const userMsg = { sender: 'user', text: question };
-      const placeholderMsg = { sender: 'bot', text: 'Searching the power plant dataset...' };
+      const wantsChart = detectChartIntentFrontend(question);
+      const userMsg = { sender: 'user', type: 'text', text: question };
+      const placeholderMsg = {
+        sender: 'bot',
+        type: 'status',
+        text: wantsChart ? 'Generating chart...' : 'Thinking...',
+      };
 
       setMessages((prev) => [...prev, userMsg, placeholderMsg]);
       setInput('');
-      setLoading(true);
+      setLoadingChat(true);
 
       try {
         const response = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:3001'}/api/chat`, {
@@ -190,43 +313,49 @@ function Dashboard() {
           body: JSON.stringify({ message: question }),
         });
 
-        let botText = 'Sorry, the assistant is unavailable right now.';
-        if (response.ok) {
-          botText = await response.text();
-        } else {
-          const errorBody = await response.text();
-          try {
-            const parsed = JSON.parse(errorBody);
-            botText = parsed.error || botText;
-          } catch {
-            botText = errorBody || botText;
+        const contentType = response.headers.get('content-type') || '';
+        let botMessage;
+
+        if (response.ok && contentType.includes('application/json')) {
+          const payload = await response.json();
+          if (payload?.type === 'chart' && payload.data) {
+            botMessage = { sender: 'bot', type: 'chart', chart: payload };
+          } else {
+            const text = payload?.message || payload?.response || JSON.stringify(payload);
+            botMessage = { sender: 'bot', type: 'text', text };
           }
+        } else if (response.ok) {
+          const text = await response.text();
+          botMessage = { sender: 'bot', type: 'text', text: text || 'No response came back from the assistant.' };
+        } else {
+          const errorText = await response.text();
+          botMessage = { sender: 'bot', type: 'text', text: errorText || 'The assistant returned an error.' };
         }
 
         setMessages((prev) => {
           const current = [...prev];
-          const placeholderIndex = current.findIndex((msg) => msg.sender === 'bot' && msg.text === 'Searching the power plant dataset...');
+          const placeholderIndex = current.findIndex((msg) => msg.sender === 'bot' && msg.type === 'status');
           if (placeholderIndex >= 0) {
-            current[placeholderIndex] = { sender: 'bot', text: botText };
+            current[placeholderIndex] = botMessage;
           } else {
-            current.push({ sender: 'bot', text: botText });
+            current.push(botMessage);
           }
           return current;
         });
-      } catch (err) {
-        const errorMessage = 'Sorry, the assistant is unavailable right now. Please make sure Ollama is running.';
+      } catch (error) {
+        const errorMessage = 'Sorry, the assistant is unavailable. Please make sure Ollama is running locally.';
         setMessages((prev) => {
           const current = [...prev];
-          const placeholderIndex = current.findIndex((msg) => msg.sender === 'bot' && msg.text === 'Searching the power plant dataset...');
+          const placeholderIndex = current.findIndex((msg) => msg.sender === 'bot' && msg.type === 'status');
           if (placeholderIndex >= 0) {
-            current[placeholderIndex] = { sender: 'bot', text: errorMessage };
+            current[placeholderIndex] = { sender: 'bot', type: 'text', text: errorMessage };
           } else {
-            current.push({ sender: 'bot', text: errorMessage });
+            current.push({ sender: 'bot', type: 'text', text: errorMessage });
           }
           return current;
         });
       } finally {
-        setLoading(false);
+        setLoadingChat(false);
       }
     };
 
@@ -235,23 +364,39 @@ function Dashboard() {
         <button className="chatbot-button" onClick={() => setOpen(!open)} title="AI Assistant">
           <MessageSquare size={24} />
         </button>
+
         <div className={`chatbot-widget ${open ? 'open' : ''}`}>
-          <div className="chatbot-header">AI Assistant</div>
-          <div className="chatbot-body">
-            {messages.map((msg, idx) => (
-              <div key={idx} className={`chatbot-message ${msg.sender}`}>{msg.text}</div>
+          <div className="chatbot-header">
+            <div className="chatbot-title">AI Assistant</div>
+            <button className="chatbot-close" onClick={() => setOpen(false)} aria-label="Close chat">
+              <CloseIcon size={18} />
+            </button>
+          </div>
+
+          <div className="chatbot-body" ref={chatBodyRef}>
+            {messages.length === 0 ? (
+              <div className="chatbot-empty-state">
+                Ask about trends, comparisons, or data insights from the dashboard.
+              </div>
+            ) : messages.map((msg, idx) => (
+              <div key={idx} className={`chatbot-message ${msg.sender} ${msg.type}`}>
+                {msg.type === 'chart'
+                  ? renderChartMessage(msg.chart)
+                  : <div className="message-text">{msg.text}</div>}
+              </div>
             ))}
           </div>
-          <div className="chatbot-input-area">
+
+          <div className="chatbot-footer">
             <input
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask something..."
+              placeholder="Ask for trends, comparisons, or CSV details..."
               onKeyDown={(e) => { if (e.key === 'Enter') sendMessage(); }}
-              disabled={loading}
+              disabled={loadingChat}
             />
-            <button onClick={sendMessage} disabled={loading}>Send</button>
+            <button onClick={sendMessage} disabled={loadingChat}>Send</button>
           </div>
         </div>
       </div>

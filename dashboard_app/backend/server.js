@@ -61,6 +61,7 @@ function formatReadableDate(dateString) {
 function normalizeText(value) {
   return String(value || '')
     .toLowerCase()
+    .replace(/(\d)\s*[x×]\s*(\d)/g, '$1 $2')
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
 }
@@ -147,6 +148,207 @@ function extractMovementTypeFilter(question) {
     return ['261', '262'];
   }
   return [];
+}
+
+function parseMonthYear(question) {
+  const lower = question.toLowerCase();
+  const monthMap = {
+    january: 0,
+    february: 1,
+    march: 2,
+    april: 3,
+    may: 4,
+    june: 5,
+    july: 6,
+    august: 7,
+    september: 8,
+    october: 9,
+    november: 10,
+    december: 11,
+  };
+
+  const monthMatch = lower.match(/(january|february|march|april|may|june|july|august|september|october|november|december)/i);
+  const yearMatch = lower.match(/\b(20\d{2})\b/);
+  if (!monthMatch) return null;
+  const month = monthMap[monthMatch[1].toLowerCase()];
+  const year = yearMatch ? parseInt(yearMatch[1], 10) : null;
+  return { month, year };
+}
+
+function identityMatch(normalizedQuestion, candidates) {
+  const lower = normalizeText(normalizedQuestion);
+  return candidates.find((candidate) => {
+    const normalized = normalizeText(candidate);
+    if (!normalized) return false;
+    if (lower.includes(normalized)) return true;
+
+    const candidateTokens = normalized.split(' ').filter(Boolean);
+    if (!candidateTokens.length) return false;
+
+    const matches = candidateTokens.reduce((count, token) => count + (lower.includes(token) ? 1 : 0), 0);
+    return matches >= Math.max(2, Math.floor(candidateTokens.length * 0.6));
+  });
+}
+
+function isGeneralKnowledgeQuestion(question) {
+  const lower = String(question || '').toLowerCase();
+  return /\b(hi|hello|hey|greetings|good morning|good afternoon|good evening|how are you|who are you|what are you|tell me about yourself|your name|where are you from|what is ai|what is artificial intelligence|define ai|define artificial intelligence|what is machine learning|help me|thanks|thank you|bye|goodbye)\b/.test(lower);
+}
+
+function detectDashboardQuery(question) {
+  const lower = String(question || '').toLowerCase();
+  if (isGeneralKnowledgeQuestion(question)) {
+    return false;
+  }
+  return /\b(plant|plants|generation|generated|production|produced|consumption|consumed|use|used|region|location|city|power|quantity|kwh|material|movement|movement type|date|month|year|trend|compare|comparison|volume|metric|capacity|forecast|load|top|highest|lowest|most|least)\b/.test(lower);
+}
+
+function detectChartIntent(question) {
+  const lower = String(question || '').toLowerCase();
+  return /trend|history|compare|comparison|visual|chart|graph|plot|show.*trend|versus|\svs\s/.test(lower);
+}
+
+function buildChartResponse(question, rows) {
+  const lower = question.toLowerCase();
+  const plantNames = [...new Set(rows.map((row) => row.plantName).filter(Boolean))];
+  const cities = [...new Set(rows.map((row) => row.city).filter(Boolean))];
+  const plant = identityMatch(question, plantNames);
+  const city = identityMatch(question, cities);
+  const exactDate = extractRequestedDate(question);
+  const monthYear = parseMonthYear(question);
+
+  let filtered = rows;
+  if (plant) {
+    filtered = filtered.filter((row) => normalizeText(row.plantName).includes(normalizeText(plant)));
+  }
+  if (city) {
+    filtered = filtered.filter((row) => normalizeText(row.city).includes(normalizeText(city)));
+  }
+  if (exactDate) {
+    filtered = filtered.filter((row) => row.date === exactDate);
+  }
+  if (monthYear) {
+    filtered = filtered.filter((row) => {
+      const year = parseInt(row.date.slice(0, 4), 10);
+      const month = parseInt(row.date.slice(4, 6), 10) - 1;
+      return month === monthYear.month && (monthYear.year === null || year === monthYear.year);
+    });
+  }
+
+  const wantGen = /generation|generated|produced|output/i.test(lower);
+  const wantCon = /consumption|consumed|used/i.test(lower);
+  const wantBoth = /compare|comparison|vs|versus/i.test(lower) || /generation.*consumption|consumption.*generation/i.test(lower);
+
+  if (wantBoth) {
+    filtered = filtered.filter((row) => ['101', '102', '261', '262'].includes(row.movementType));
+  } else if (wantGen && !wantCon) {
+    filtered = filtered.filter((row) => ['101', '102'].includes(row.movementType));
+  } else if (wantCon && !wantGen) {
+    filtered = filtered.filter((row) => ['261', '262'].includes(row.movementType));
+  }
+
+  if (!filtered.length) {
+    return null;
+  }
+
+  const chart = { type: 'chart', title: '', subtitle: '', chartType: 'line', data: null, table: null };
+
+  const groupByDate = filtered.reduce((acc, row) => {
+    if (!acc[row.date]) acc[row.date] = { generation: 0, consumption: 0 };
+    if (['101', '102'].includes(row.movementType)) acc[row.date].generation += row.quantity;
+    if (['261', '262'].includes(row.movementType)) acc[row.date].consumption += row.quantity;
+    return acc;
+  }, {});
+
+  const sortedDates = Object.keys(groupByDate).sort();
+  const labels = sortedDates.map((date) => formatReadableDate(date));
+  const generationSeries = sortedDates.map((date) => groupByDate[date].generation);
+  const consumptionSeries = sortedDates.map((date) => groupByDate[date].consumption);
+
+  if (/trend|history|over time/i.test(lower)) {
+    chart.chartType = 'line';
+    chart.title = plant ? `Generation Trend for ${plant}` : city ? `Trend for ${city}` : 'Generation vs Consumption Trend';
+    const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+    chart.subtitle = monthYear ? `${monthYear.year || ''} ${monthYear.month !== undefined ? monthNames[monthYear.month] : ''}`.trim() : 'Trend over time';
+    chart.data = {
+      labels,
+      datasets: [],
+    };
+    if (wantBoth) {
+      chart.data.datasets.push({ label: 'Generation', data: generationSeries, color: '#10b981' });
+      chart.data.datasets.push({ label: 'Consumption', data: consumptionSeries, color: '#f43f5e' });
+    } else if (wantCon) {
+      chart.data.datasets.push({ label: 'Consumption', data: consumptionSeries, color: '#f43f5e' });
+    } else {
+      chart.data.datasets.push({ label: 'Generation', data: generationSeries, color: '#10b981' });
+    }
+    chart.table = {
+      headers: ['Date', 'Generation', 'Consumption'],
+      rows: sortedDates.map((date) => [formatReadableDate(date), generationSeries[sortedDates.indexOf(date)], consumptionSeries[sortedDates.indexOf(date)]])
+    };
+    return chart;
+  }
+
+  if (/compare|comparison|vs|versus/i.test(lower)) {
+    if (plant || city) {
+      const totals = { generation: 0, consumption: 0 };
+      filtered.forEach((row) => {
+        if (['101', '102'].includes(row.movementType)) totals.generation += row.quantity;
+        if (['261', '262'].includes(row.movementType)) totals.consumption += row.quantity;
+      });
+      chart.chartType = 'bar';
+      chart.title = `Generation vs Consumption for ${plant || city}`;
+      chart.subtitle = 'Total volume comparison';
+      chart.data = {
+        labels: ['Generation', 'Consumption'],
+        datasets: [{ label: 'kWh', data: [totals.generation, totals.consumption], color: '#3b82f6' }]
+      };
+      chart.table = {
+        headers: ['Metric', 'Value'],
+        rows: [['Generation', totals.generation], ['Consumption', totals.consumption]]
+      };
+      return chart;
+    }
+    const groupedByPlant = {};
+    filtered.forEach((row) => {
+      const key = row.plantName || row.city || row.senderPlantKey || 'Unknown';
+      groupedByPlant[key] = (groupedByPlant[key] || 0) + row.quantity;
+    });
+    const sorted = Object.entries(groupedByPlant).sort((a, b) => b[1] - a[1]).slice(0, 8);
+    chart.chartType = 'bar';
+    chart.title = 'Top volume comparison';
+    chart.subtitle = 'Comparison by plant';
+    chart.data = { labels: sorted.map((item) => item[0].length > 16 ? item[0].slice(0, 16) + '...' : item[0]), datasets: [{ label: 'kWh', data: sorted.map((item) => item[1]), color: '#3b82f6' }] };
+    chart.table = { headers: ['Plant', 'Total'], rows: sorted.map((item) => [item[0], item[1]]) };
+    return chart;
+  }
+
+  if (/breakdown|distribution|share|pie|percent/i.test(lower)) {
+    const categoryTotals = { generation: 0, consumption: 0 };
+    filtered.forEach((row) => {
+      if (['101', '102'].includes(row.movementType)) categoryTotals.generation += row.quantity;
+      if (['261', '262'].includes(row.movementType)) categoryTotals.consumption += row.quantity;
+    });
+    chart.chartType = 'pie';
+    chart.title = `Volume Breakdown${plant ? ` for ${plant}` : city ? ` for ${city}` : ''}`;
+    chart.subtitle = 'Generation vs Consumption share';
+    chart.data = {
+      labels: ['Generation', 'Consumption'],
+      datasets: [{ label: 'Share', data: [categoryTotals.generation, categoryTotals.consumption], colors: ['#10b981', '#f43f5e'] }]
+    };
+    chart.table = { headers: ['Category', 'Value'], rows: [['Generation', categoryTotals.generation], ['Consumption', categoryTotals.consumption]] };
+    return chart;
+  }
+
+  return null;
+}
+
+function createNumberFormatter(value) {
+  if (value === null || value === undefined) return '0';
+  if (value >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
+  if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
+  if (value >= 1e3) return `${(value / 1e3).toFixed(1)}k`;
+  return value.toLocaleString();
 }
 
 function loadDashboardRows() {
@@ -239,59 +441,65 @@ app.post('/api/chat', async (req, res) => {
     }
 
     console.log(`\n📝 Chat Request: "${message}"`);
-    console.log('🔄 Delegating to Ollama RAG for all requests');
 
-    const relevantRows = getRelevantRows(message, dashboardRows);
-    if (!relevantRows.length) {
-      console.log('❌ No relevant rows found in CSV');
-      return res.type('text/plain').send('The information is unavailable in the provided CSV data.');
+    const isDashboardQuery = detectDashboardQuery(message);
+    const chartResponse = isDashboardQuery && detectChartIntent(message) ? buildChartResponse(message, dashboardRows) : null;
+    if (chartResponse) {
+      console.log('✅ Detected dashboard chart intent; returning structured chart payload');
+      return res.json(chartResponse);
     }
 
-    console.log(`   Found ${relevantRows.length} relevant CSV rows for context`);
-
-    const contextText = relevantRows.map((row, index) => {
-      const readableDate = formatReadableDate(row.date);
-      return `${index + 1}. Date: ${readableDate} | Movement type: ${row.movementType} | Quantity: ${row.quantity} | Plant: ${row.plantName || 'unknown'} | City: ${row.city || 'unknown'} | Material: ${row.material || 'unknown'}`;
-    }).join('\n');
-
-    const prompt = `You are a factual assistant. Answer ONLY using the CSV rows provided below. Do not use outside knowledge. If the requested information is not present in the provided rows, reply exactly: The information is unavailable in the provided CSV data.
-
-CSV rows:
-${contextText}
-
-Question: ${message}
-Answer in one short sentence.`;
-
-    console.log('   🤖 Calling Ollama at http://localhost:11434...');
-    const ollamaResponse = await fetch('http://localhost:11434/api/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'llama3.2',
-        prompt,
-        stream: false,
-      }),
-    });
-
-    if (!ollamaResponse.ok) {
-      const errorText = await ollamaResponse.text();
-      console.error('❌ Ollama request failed:', ollamaResponse.status, errorText);
-      return res.status(503).json({
-        error: 'Ollama is not available. Please make sure Ollama is running and the llama3.2 model is installed.',
+    const callGeneralOllama = async (promptText) => {
+      const response = await fetch('http://localhost:11434/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'llama3.2',
+          prompt: promptText,
+          stream: false,
+        }),
       });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('❌ Ollama request failed:', response.status, errorText);
+        throw new Error('Ollama unavailable');
+      }
+
+      const data = await response.json();
+      const text = typeof data?.response === 'string' ? data.response.trim() : '';
+      if (!text) {
+        console.error('❌ Ollama returned empty response');
+        throw new Error('Empty Ollama response');
+      }
+      return text;
+    };
+
+    if (isDashboardQuery) {
+      console.log('🔄 Dashboard query detected; searching CSV for relevant rows');
+      const relevantRows = getRelevantRows(message, dashboardRows);
+      if (relevantRows.length) {
+        console.log(`   Found ${relevantRows.length} relevant CSV rows for context`);
+        const contextText = relevantRows.map((row, index) => {
+          const readableDate = formatReadableDate(row.date);
+          return `${index + 1}. Date: ${readableDate} | Movement type: ${row.movementType} | Quantity: ${row.quantity} | Plant: ${row.plantName || 'unknown'} | City: ${row.city || 'unknown'} | Material: ${row.material || 'unknown'}`;
+        }).join('\n');
+
+        const prompt = `You are a factual assistant. Answer ONLY using the CSV rows provided below. Do not use outside knowledge. If the requested information is not present in the provided rows, reply with the best possible answer based on the data provided.\n\nCSV rows:\n${contextText}\n\nQuestion: ${message}\nAnswer in one short sentence.`;
+
+        console.log('   🤖 Calling Ollama for dashboard answer with CSV context');
+        const responseText = await callGeneralOllama(prompt);
+        console.log('✅ [OLLAMA RESPONSE] Received dashboard answer from Ollama');
+        return res.type('text/plain').send(responseText);
+      }
+
+      console.log('🔁 No relevant CSV data found for dashboard query; falling back to general Ollama knowledge');
     }
 
-    const data = await ollamaResponse.json();
-    const responseText = typeof data?.response === 'string' ? data.response.trim() : '';
-
-    if (!responseText) {
-      console.error('❌ Ollama returned empty response');
-      return res.status(502).json({ error: 'Ollama returned an empty response.' });
-    }
-
-    console.log('✅ [OLLAMA RESPONSE] Received answer from Ollama model (llama3.2)');
-    console.log(`   Response: ${responseText.substring(0, 80)}...`);
-    return res.type('text/plain').send(responseText);
+    console.log('🔄 Delegating to Ollama for general knowledge response');
+    const generalText = await callGeneralOllama(message);
+    console.log('✅ [OLLAMA RESPONSE] Received general answer from Ollama');
+    return res.type('text/plain').send(generalText);
   } catch (error) {
     console.error('❌ Chat handler failure:', error.message);
     return res.status(503).json({ error: 'Ollama is not available. Please make sure Ollama is running.' });
