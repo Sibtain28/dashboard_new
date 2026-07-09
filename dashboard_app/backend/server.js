@@ -2,37 +2,38 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const dotenv = require('dotenv');
-const fs = require('fs');
-const csv = require('csv-parser');
+const { Pool } = require('pg');
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const csvFilePath = resolveDataFilePath();
-let dashboardRows = [];
 
-function resolveDataFilePath() {
-  const workspaceRoot = path.join(__dirname, '../..');
-  const candidates = [];
-  const mergedPath = path.join(workspaceRoot, 'merged_dashboard_data.csv');
-  if (fs.existsSync(mergedPath)) {
-    candidates.push(mergedPath);
+// PostgreSQL connection pool
+const pool = new Pool({
+  user: "postgres",
+  host: "localhost",
+  database: "power_dashboard",
+  password: "sibtain@2006",
+  port: 5433,
+});
+
+let cachedPlantNames = [];
+let cachedCities = [];
+
+async function initDbCache() {
+  try {
+    const result = await pool.query('SELECT DISTINCT name1, ort01 FROM plant_master');
+    cachedPlantNames = [...new Set(result.rows.map(r => r.name1).filter(Boolean))];
+    cachedCities = [...new Set(result.rows.map(r => r.ort01).filter(Boolean))];
+    console.log(`Loaded ${cachedPlantNames.length} plants and ${cachedCities.length} cities from DB.`);
+  } catch (err) {
+    console.error('Failed to load DB cache:', err.message);
   }
-
-  const sourceFiles = fs.readdirSync(workspaceRoot)
-    .filter((file) => file.startsWith('FACT_QUALITY_MATERIAL_MOVEMENT_') && file.endsWith('.csv'))
-    .map((file) => path.join(workspaceRoot, file));
-
-  candidates.push(...sourceFiles);
-
-  if (!candidates.length) {
-    return mergedPath;
-  }
-
-  candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-  return candidates[0];
 }
+
+// Session store for conversation state
+const activeSessions = new Map();
 
 function formatDateYYYYMMDD(date) {
   const year = date.getUTCFullYear();
@@ -42,13 +43,14 @@ function formatDateYYYYMMDD(date) {
 }
 
 function formatReadableDate(dateString) {
-  if (!dateString || !/^\d{8}$/.test(dateString)) {
-    return dateString || '';
+  const normalizedDate = String(dateString || '');
+  if (!normalizedDate || !/^\d{8}$/.test(normalizedDate)) {
+    return normalizedDate || '';
   }
 
-  const year = parseInt(dateString.slice(0, 4), 10);
-  const month = parseInt(dateString.slice(4, 6), 10) - 1;
-  const day = parseInt(dateString.slice(6, 8), 10);
+  const year = parseInt(normalizedDate.slice(0, 4), 10);
+  const month = parseInt(normalizedDate.slice(4, 6), 10) - 1;
+  const day = parseInt(normalizedDate.slice(6, 8), 10);
   const parsedDate = new Date(Date.UTC(year, month, day));
 
   return parsedDate.toLocaleDateString('en-GB', {
@@ -56,6 +58,82 @@ function formatReadableDate(dateString) {
     month: 'long',
     year: 'numeric',
   });
+}
+
+function rowToDashboardRecord(row) {
+  return {
+    ...row,
+    date: String(row.date || ''),
+    movementType: String(row.movementType || ''),
+    quantity: parseFloat(row.quantity || 0),
+  };
+}
+
+function getDateRangeClause(dateRange, latestDate, values, paramCount) {
+  if (!latestDate || !dateRange || dateRange === 'All') {
+    return { clause: '', paramCount };
+  }
+
+  if (dateRange === 'Month') {
+    values.push(`${String(latestDate).slice(0, 6)}%`);
+    return { clause: ` AND f.posting_date_key::text LIKE $${paramCount++}`, paramCount };
+  }
+
+  if (dateRange === 'Year') {
+    values.push(`${String(latestDate).slice(0, 4)}%`);
+    return { clause: ` AND f.posting_date_key::text LIKE $${paramCount++}`, paramCount };
+  }
+
+  const latestDateObj = new Date(Date.UTC(
+    parseInt(String(latestDate).slice(0, 4), 10),
+    parseInt(String(latestDate).slice(4, 6), 10) - 1,
+    parseInt(String(latestDate).slice(6, 8), 10),
+  ));
+
+  if (Number.isNaN(latestDateObj.getTime())) {
+    return { clause: '', paramCount };
+  }
+
+  if (dateRange === '7D' || dateRange === '30D') {
+    const start = new Date(latestDateObj);
+    start.setUTCDate(start.getUTCDate() - (dateRange === '7D' ? 7 : 30));
+    values.push(formatDateYYYYMMDD(start), String(latestDate));
+    return {
+      clause: ` AND f.posting_date_key::text BETWEEN $${paramCount++} AND $${paramCount++}`,
+      paramCount,
+    };
+  }
+
+  return { clause: '', paramCount };
+}
+
+async function getLatestPostingDate(baseWhere = '', baseValues = []) {
+  const { rows } = await pool.query(`
+    SELECT MAX(f.posting_date_key::text) as "latestDate"
+    FROM fact_quality_material_movement f
+    LEFT JOIN plant_master p ON f.sender_plant_key = p.werks
+    WHERE f.movement_type::text IN ('101', '102', '261', '262')
+    ${baseWhere}
+  `, baseValues);
+
+  return rows[0]?.latestDate ? String(rows[0].latestDate) : null;
+}
+
+function appendEntityFilters(query, values, paramCount, { plant, city }) {
+  let nextQuery = query;
+  let nextParamCount = paramCount;
+
+  if (plant && plant !== 'All') {
+    nextQuery += ` AND p.name1 = $${nextParamCount++}`;
+    values.push(plant);
+  }
+
+  if (city && city !== 'All') {
+    nextQuery += ` AND p.ort01 ILIKE $${nextParamCount++}`;
+    values.push(`%${city}%`);
+  }
+
+  return { query: nextQuery, paramCount: nextParamCount };
 }
 
 function normalizeText(value) {
@@ -81,18 +159,8 @@ function extractRequestedDate(question) {
   }
 
   const monthMap = {
-    january: 0,
-    february: 1,
-    march: 2,
-    april: 3,
-    may: 4,
-    june: 5,
-    july: 6,
-    august: 7,
-    september: 8,
-    october: 9,
-    november: 10,
-    december: 11,
+    january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+    july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
   };
 
   const patterns = [
@@ -106,9 +174,7 @@ function extractRequestedDate(question) {
     const match = question.match(pattern);
     if (!match) continue;
 
-    let year;
-    let month;
-    let day;
+    let year, month, day;
 
     if (pattern.source.startsWith('(\\d{4})')) {
       year = parseInt(match[1], 10);
@@ -153,18 +219,8 @@ function extractMovementTypeFilter(question) {
 function parseMonthYear(question) {
   const lower = question.toLowerCase();
   const monthMap = {
-    january: 0,
-    february: 1,
-    march: 2,
-    april: 3,
-    may: 4,
-    june: 5,
-    july: 6,
-    august: 7,
-    september: 8,
-    october: 9,
-    november: 10,
-    december: 11,
+    january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+    july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
   };
 
   const monthMatch = lower.match(/(january|february|march|april|may|june|july|august|september|october|november|december)/i);
@@ -173,6 +229,117 @@ function parseMonthYear(question) {
   const month = monthMap[monthMatch[1].toLowerCase()];
   const year = yearMatch ? parseInt(yearMatch[1], 10) : null;
   return { month, year };
+}
+
+function findExplicitPlantMention(text, plantNames) {
+  if (!text) return null;
+  const lowerText = String(text).toLowerCase();
+  // Sort longest-first so a specific name (e.g. "ANGUL POWER Plant Unit5(135MW)")
+  // wins over a shorter generic name (e.g. "Power Plant").
+  // Minimum length of 14 skips ultra-generic names ("Plant", "Power Plant").
+  const sorted = [...plantNames].filter(Boolean).sort((a, b) => b.length - a.length);
+  for (const name of sorted) {
+    if (name.length < 14) continue;
+    if (lowerText.includes(name.toLowerCase())) return name;
+  }
+  return null;
+}
+
+function referencesPreviousSubject(question) {
+  return /\b(it|that|this|those|same\s+(plant|one|region|city))\b/i.test(String(question || ''));
+}
+
+function updateSessionState(sessionId, message, plantNames, cities, historyItems) {
+  if (!sessionId) return null;
+
+  if (!activeSessions.has(sessionId)) {
+    activeSessions.set(sessionId, { currentPlant: null, currentCity: null, currentDate: null });
+  }
+
+  const session = activeSessions.get(sessionId);
+  
+  let explicitPlant = findExplicitPlantMention(message, plantNames);
+  
+  if (!explicitPlant && historyItems) {
+    for (let i = historyItems.length - 1; i >= 0; i -= 1) {
+      const text = historyItems[i]?.content || historyItems[i]?.text || '';
+      explicitPlant = findExplicitPlantMention(text, plantNames);
+      if (explicitPlant) break;
+    }
+  }
+
+  if (explicitPlant) {
+    session.currentPlant = explicitPlant;
+    session.currentCity = null; 
+  }
+
+  let explicitCity = identityMatch(message, cities);
+  if (!explicitCity && historyItems) {
+    for (let i = historyItems.length - 1; i >= 0; i -= 1) {
+      const text = historyItems[i]?.content || historyItems[i]?.text || '';
+      explicitCity = identityMatch(text, cities);
+      if (explicitCity) break;
+    }
+  }
+
+  if (explicitCity && !explicitPlant) {
+    session.currentCity = explicitCity;
+    session.currentPlant = null; 
+  }
+
+  const explicitDate = extractRequestedDate(message);
+  if (explicitDate) {
+    session.currentDate = explicitDate;
+  }
+  
+  return session;
+}
+
+function resolveContextFromSession(message, session) {
+  if (!session) return { plant: null, city: null, source: 'none' };
+  
+  const isReferencingPrevious = referencesPreviousSubject(message);
+  
+  if (isReferencingPrevious) {
+    return { 
+      plant: session.currentPlant, 
+      city: session.currentCity, 
+      source: 'session_reference' 
+    };
+  }
+
+  return { 
+    plant: session.currentPlant, 
+    city: session.currentCity, 
+    source: session.currentPlant || session.currentCity ? 'current_state' : 'none' 
+  };
+}
+
+function levenshtein(a, b) {
+  const dp = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i += 1) dp[i][0] = i;
+  for (let j = 0; j <= b.length; j += 1) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost,
+      );
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+function findClosestPlants(name, plantNames, limit = 3) {
+  const target = normalizeText(name);
+  return [...plantNames]
+    .filter(Boolean)
+    .map((candidate) => ({ candidate, distance: levenshtein(target, normalizeText(candidate)) }))
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, limit)
+    .map((entry) => entry.candidate);
 }
 
 function identityMatch(normalizedQuestion, candidates) {
@@ -200,39 +367,103 @@ function detectDashboardQuery(question) {
   if (isGeneralKnowledgeQuestion(question)) {
     return false;
   }
-  return /\b(plant|plants|generation|generated|production|produced|consumption|consumed|use|used|region|location|city|power|quantity|kwh|material|movement|movement type|date|month|year|trend|compare|comparison|volume|metric|capacity|forecast|load|top|highest|lowest|most|least)\b/.test(lower);
+  return /\b(plant|plants|generation|generated|production|produced|consumption|consumed|use|used|region|location|city|power|quantity|kwh|material|movement|movement type|date|month|year|trend|compare|comparison|volume|metric|capacity|forecast|load|top|highest|lowest|most|least|it|that|this)\b/.test(lower);
 }
 
 function detectChartIntent(question) {
   const lower = String(question || '').toLowerCase();
-  return /trend|history|compare|comparison|visual|chart|graph|plot|show.*trend|versus|\svs\s/.test(lower);
+  return /trend|history|compare|comparison|visual|chart|graph|plot|show.*trend|versus|\svs\s|bar|candlestick|ohlc|pareto|gauge|histogram|distribution|waterfall|pie|breakdown|share|percent/.test(lower);
 }
 
-function buildChartResponse(question, rows) {
+function getRequestedChartType(question) {
+  const lower = String(question || '').toLowerCase();
+  if (/candlestick|ohlc/.test(lower)) return 'candlestick';
+  if (/pareto/.test(lower)) return 'pareto';
+  if (/gauge|meter|target|utili[sz]ation|ratio/.test(lower)) return 'gauge';
+  if (/histogram|frequency|bucket/.test(lower)) return 'histogram';
+  if (/waterfall|bridge|variance|walk/.test(lower)) return 'waterfall';
+  if (/\bbar\b|bar chart/.test(lower)) return 'bar';
+  if (/breakdown|distribution|share|pie|percent/.test(lower)) return 'pie';
+  if (/trend|history|over time/.test(lower)) return 'line';
+  return null;
+}
+
+function getSeriesTotals(rows) {
+  return rows.reduce((acc, row) => {
+    if (['101', '102'].includes(row.movementType)) acc.generation += row.quantity;
+    if (['261', '262'].includes(row.movementType)) acc.consumption += row.quantity;
+    return acc;
+  }, { generation: 0, consumption: 0 });
+}
+
+function groupTotalsByDate(rows) {
+  const grouped = rows.reduce((acc, row) => {
+    if (!acc[row.date]) acc[row.date] = { generation: 0, consumption: 0, total: 0 };
+    if (['101', '102'].includes(row.movementType)) acc[row.date].generation += row.quantity;
+    if (['261', '262'].includes(row.movementType)) acc[row.date].consumption += row.quantity;
+    acc[row.date].total += row.quantity;
+    return acc;
+  }, {});
+  const sortedDates = Object.keys(grouped).sort();
+  return { grouped, sortedDates };
+}
+
+function getTopGroupedTotals(rows, groupKey = 'plant', limit = 10) {
+  const grouped = {};
+  rows.forEach((row) => {
+    const key = groupKey === 'city'
+      ? (row.city || 'Unknown')
+      : (row.plantName || row.city || row.senderPlantKey || 'Unknown');
+    grouped[key] = (grouped[key] || 0) + row.quantity;
+  });
+  return Object.entries(grouped).sort((a, b) => b[1] - a[1]).slice(0, limit);
+}
+
+function shortenLabel(value, max = 18) {
+  const text = String(value || 'Unknown');
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+async function buildChartResponse(question, resolvedPlant, resolvedCity) {
   const lower = question.toLowerCase();
-  const plantNames = [...new Set(rows.map((row) => row.plantName).filter(Boolean))];
-  const cities = [...new Set(rows.map((row) => row.city).filter(Boolean))];
-  const plant = identityMatch(question, plantNames);
-  const city = identityMatch(question, cities);
   const exactDate = extractRequestedDate(question);
   const monthYear = parseMonthYear(question);
+  const requestedChartType = getRequestedChartType(question);
 
-  let filtered = rows;
-  if (plant) {
-    filtered = filtered.filter((row) => normalizeText(row.plantName).includes(normalizeText(plant)));
+  let query = `
+    SELECT 
+      f.posting_date_key::text as date, 
+      f.movement_type::text as "movementType", 
+      f.quantity, 
+      p.name1 as "plantName", 
+      p.ort01 as city, 
+      f.sender_plant_key as "senderPlantKey"
+    FROM fact_quality_material_movement f
+    LEFT JOIN plant_master p ON f.sender_plant_key = p.werks
+    WHERE 1=1
+  `;
+  const values = [];
+  let paramCount = 1;
+
+  if (resolvedPlant) {
+    query += ` AND p.name1 = $${paramCount++}`;
+    values.push(resolvedPlant);
+  } else if (resolvedCity) {
+    query += ` AND p.ort01 ILIKE $${paramCount++}`;
+    values.push(`%${resolvedCity}%`);
   }
-  if (city) {
-    filtered = filtered.filter((row) => normalizeText(row.city).includes(normalizeText(city)));
-  }
+
   if (exactDate) {
-    filtered = filtered.filter((row) => row.date === exactDate);
+    query += ` AND f.posting_date_key::text = $${paramCount++}`;
+    values.push(exactDate);
   }
+
   if (monthYear) {
-    filtered = filtered.filter((row) => {
-      const year = parseInt(row.date.slice(0, 4), 10);
-      const month = parseInt(row.date.slice(4, 6), 10) - 1;
-      return month === monthYear.month && (monthYear.year === null || year === monthYear.year);
-    });
+    const yearStr = monthYear.year !== null ? String(monthYear.year) : '__';
+    const monthStr = String(monthYear.month + 1).padStart(2, '0');
+    const likePattern = monthYear.year !== null ? `${yearStr}${monthStr}%` : `____${monthStr}%`;
+    query += ` AND f.posting_date_key::text LIKE $${paramCount++}`;
+    values.push(likePattern);
   }
 
   const wantGen = /generation|generated|produced|output/i.test(lower);
@@ -240,40 +471,157 @@ function buildChartResponse(question, rows) {
   const wantBoth = /compare|comparison|vs|versus/i.test(lower) || /generation.*consumption|consumption.*generation/i.test(lower);
 
   if (wantBoth) {
-    filtered = filtered.filter((row) => ['101', '102', '261', '262'].includes(row.movementType));
+    query += ` AND f.movement_type::text IN ('101', '102', '261', '262')`;
   } else if (wantGen && !wantCon) {
-    filtered = filtered.filter((row) => ['101', '102'].includes(row.movementType));
+    query += ` AND f.movement_type::text IN ('101', '102')`;
   } else if (wantCon && !wantGen) {
-    filtered = filtered.filter((row) => ['261', '262'].includes(row.movementType));
+    query += ` AND f.movement_type::text IN ('261', '262')`;
   }
+
+  const { rows } = await pool.query(query, values);
+  const filtered = rows.map(rowToDashboardRecord);
 
   if (!filtered.length) {
     return null;
   }
 
-  const chart = { type: 'chart', title: '', subtitle: '', chartType: 'line', data: null, table: null };
+  const chart = {
+    type: 'chart',
+    title: '',
+    subtitle: '',
+    chartType: 'line',
+    data: null,
+    table: null,
+    plant: resolvedPlant || null,
+  };
 
-  const groupByDate = filtered.reduce((acc, row) => {
-    if (!acc[row.date]) acc[row.date] = { generation: 0, consumption: 0 };
-    if (['101', '102'].includes(row.movementType)) acc[row.date].generation += row.quantity;
-    if (['261', '262'].includes(row.movementType)) acc[row.date].consumption += row.quantity;
-    return acc;
-  }, {});
-
-  const sortedDates = Object.keys(groupByDate).sort();
+  const { grouped: groupByDate, sortedDates } = groupTotalsByDate(filtered);
   const labels = sortedDates.map((date) => formatReadableDate(date));
   const generationSeries = sortedDates.map((date) => groupByDate[date].generation);
   const consumptionSeries = sortedDates.map((date) => groupByDate[date].consumption);
 
-  if (/trend|history|over time/i.test(lower)) {
+  const subjectLabel = resolvedPlant || resolvedCity || null;
+  const groupLabel = resolvedCity ? 'plant' : 'plant';
+
+  if (requestedChartType === 'candlestick') {
+    let previousClose = sortedDates.length ? groupByDate[sortedDates[0]].total : 0;
+    const candles = sortedDates.map((date, index) => {
+      const close = groupByDate[date].total;
+      const open = index === 0 ? 0 : previousClose;
+      previousClose = close;
+      const high = Math.max(open, close, groupByDate[date].generation, groupByDate[date].consumption);
+      const low = Math.min(open, close, groupByDate[date].generation, groupByDate[date].consumption);
+      return { open, high, low, close };
+    });
+    chart.chartType = 'candlestick';
+    chart.title = `Candlestick Volume${subjectLabel ? ` for ${subjectLabel}` : ''}`;
+    chart.subtitle = 'Daily open, high, low, close from grouped PostgreSQL totals';
+    chart.data = { labels, datasets: [{ label: 'Volume', data: candles, color: '#2563eb' }] };
+    chart.table = {
+      headers: ['Date', 'Open', 'High', 'Low', 'Close'],
+      rows: sortedDates.map((date, index) => [formatReadableDate(date), candles[index].open, candles[index].high, candles[index].low, candles[index].close]),
+    };
+    return chart;
+  }
+
+  if (requestedChartType === 'pareto') {
+    const sorted = getTopGroupedTotals(filtered, groupLabel, 10);
+    const total = sorted.reduce((sum, item) => sum + item[1], 0);
+    let runningTotal = 0;
+    const cumulative = sorted.map((item) => {
+      runningTotal += item[1];
+      return total ? Number(((runningTotal / total) * 100).toFixed(1)) : 0;
+    });
+    chart.chartType = 'pareto';
+    chart.title = `Pareto Analysis${subjectLabel ? ` for ${subjectLabel}` : ''}`;
+    chart.subtitle = 'Top contributors with cumulative percentage';
+    chart.data = {
+      labels: sorted.map((item) => shortenLabel(item[0], 14)),
+      datasets: [
+        { label: 'Volume', data: sorted.map((item) => item[1]), color: '#2563eb', fullLabels: sorted.map((item) => item[0]) },
+        { label: 'Cumulative %', data: cumulative, color: '#f59e0b', valueType: 'percent' },
+      ],
+    };
+    chart.table = { headers: ['Plant', 'Total', 'Cumulative %'], rows: sorted.map((item, index) => [item[0], item[1], cumulative[index]]) };
+    return chart;
+  }
+
+  if (requestedChartType === 'gauge') {
+    const totals = getSeriesTotals(filtered);
+    const value = wantCon && !wantGen
+      ? totals.consumption
+      : wantBoth
+        ? totals.generation - totals.consumption
+        : totals.generation;
+    const max = Math.max(totals.generation, totals.consumption, Math.abs(value), 1);
+    chart.chartType = 'gauge';
+    chart.title = `Gauge${subjectLabel ? ` for ${subjectLabel}` : ''}`;
+    chart.subtitle = wantBoth ? 'Net generation against highest category total' : 'Selected category against observed maximum';
+    chart.data = {
+      labels: ['Value'],
+      datasets: [{ label: wantBoth ? 'Net Difference' : (wantCon ? 'Consumption' : 'Generation'), data: [value], max, color: value >= 0 ? '#10b981' : '#f43f5e' }],
+    };
+    chart.table = { headers: ['Metric', 'Value'], rows: [['Generation', totals.generation], ['Consumption', totals.consumption], ['Net', totals.generation - totals.consumption]] };
+    return chart;
+  }
+
+  if (requestedChartType === 'histogram') {
+    const quantities = filtered.map((row) => row.quantity).filter((value) => Number.isFinite(value));
+    if (!quantities.length) {
+      return null;
+    }
+    const min = Math.min(...quantities);
+    const max = Math.max(...quantities);
+    const bucketCount = Math.min(8, Math.max(4, Math.ceil(Math.sqrt(quantities.length))));
+    const width = Math.max(1, (max - min) / bucketCount);
+    const buckets = Array.from({ length: bucketCount }, (_, index) => {
+      const start = min + index * width;
+      const end = index === bucketCount - 1 ? max : start + width;
+      return { start, end, count: 0 };
+    });
+    quantities.forEach((value) => {
+      const index = Math.min(bucketCount - 1, Math.floor((value - min) / width));
+      buckets[index].count += 1;
+    });
+    chart.chartType = 'histogram';
+    chart.title = `Quantity Histogram${subjectLabel ? ` for ${subjectLabel}` : ''}`;
+    chart.subtitle = 'Frequency distribution of PostgreSQL quantity rows';
+    chart.data = {
+      labels: buckets.map((bucket) => `${Math.round(bucket.start).toLocaleString()}-${Math.round(bucket.end).toLocaleString()}`),
+      datasets: [{ label: 'Rows', data: buckets.map((bucket) => bucket.count), color: '#7c3aed' }],
+    };
+    chart.table = { headers: ['Range', 'Rows'], rows: buckets.map((bucket) => [`${bucket.start.toFixed(0)}-${bucket.end.toFixed(0)}`, bucket.count]) };
+    return chart;
+  }
+
+  if (requestedChartType === 'waterfall') {
+    const movementTotals = { '101': 0, '102': 0, '261': 0, '262': 0 };
+    filtered.forEach((row) => {
+      if (Object.prototype.hasOwnProperty.call(movementTotals, row.movementType)) movementTotals[row.movementType] += row.quantity;
+    });
+    const steps = [
+      ['101 Generation', movementTotals['101']],
+      ['102 Generation', movementTotals['102']],
+      ['261 Consumption', -movementTotals['261']],
+      ['262 Consumption', -movementTotals['262']],
+    ];
+    chart.chartType = 'waterfall';
+    chart.title = `Waterfall Bridge${subjectLabel ? ` for ${subjectLabel}` : ''}`;
+    chart.subtitle = 'Movement type contribution to net volume';
+    chart.data = {
+      labels: [...steps.map((step) => step[0]), 'Net'],
+      datasets: [{ label: 'kWh', data: [...steps.map((step) => step[1]), steps.reduce((sum, step) => sum + step[1], 0)], color: '#2563eb' }],
+    };
+    chart.table = { headers: ['Step', 'Delta'], rows: chart.data.labels.map((label, index) => [label, chart.data.datasets[0].data[index]]) };
+    return chart;
+  }
+
+  if (requestedChartType === 'line' || /trend|history|over time/i.test(lower)) {
     chart.chartType = 'line';
-    chart.title = plant ? `Generation Trend for ${plant}` : city ? `Trend for ${city}` : 'Generation vs Consumption Trend';
+    chart.title = subjectLabel ? `Generation Trend for ${subjectLabel}` : 'Generation vs Consumption Trend';
     const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
     chart.subtitle = monthYear ? `${monthYear.year || ''} ${monthYear.month !== undefined ? monthNames[monthYear.month] : ''}`.trim() : 'Trend over time';
-    chart.data = {
-      labels,
-      datasets: [],
-    };
+    chart.data = { labels, datasets: [] };
     if (wantBoth) {
       chart.data.datasets.push({ label: 'Generation', data: generationSeries, color: '#10b981' });
       chart.data.datasets.push({ label: 'Consumption', data: consumptionSeries, color: '#f43f5e' });
@@ -284,102 +632,121 @@ function buildChartResponse(question, rows) {
     }
     chart.table = {
       headers: ['Date', 'Generation', 'Consumption'],
-      rows: sortedDates.map((date) => [formatReadableDate(date), generationSeries[sortedDates.indexOf(date)], consumptionSeries[sortedDates.indexOf(date)]])
+      rows: sortedDates.map((date) => [formatReadableDate(date), groupByDate[date].generation, groupByDate[date].consumption]),
     };
     return chart;
   }
 
-  if (/compare|comparison|vs|versus/i.test(lower)) {
-    if (plant || city) {
+  if (requestedChartType === 'bar' || /compare|comparison|vs|versus/i.test(lower)) {
+    if (subjectLabel) {
       const totals = { generation: 0, consumption: 0 };
       filtered.forEach((row) => {
         if (['101', '102'].includes(row.movementType)) totals.generation += row.quantity;
         if (['261', '262'].includes(row.movementType)) totals.consumption += row.quantity;
       });
       chart.chartType = 'bar';
-      chart.title = `Generation vs Consumption for ${plant || city}`;
+      chart.title = `Generation vs Consumption for ${subjectLabel}`;
       chart.subtitle = 'Total volume comparison';
       chart.data = {
         labels: ['Generation', 'Consumption'],
-        datasets: [{ label: 'kWh', data: [totals.generation, totals.consumption], color: '#3b82f6' }]
+        datasets: [{ label: 'kWh', data: [totals.generation, totals.consumption], color: '#3b82f6' }],
       };
       chart.table = {
         headers: ['Metric', 'Value'],
-        rows: [['Generation', totals.generation], ['Consumption', totals.consumption]]
+        rows: [['Generation', totals.generation], ['Consumption', totals.consumption]],
       };
       return chart;
     }
-    const groupedByPlant = {};
-    filtered.forEach((row) => {
-      const key = row.plantName || row.city || row.senderPlantKey || 'Unknown';
-      groupedByPlant[key] = (groupedByPlant[key] || 0) + row.quantity;
-    });
-    const sorted = Object.entries(groupedByPlant).sort((a, b) => b[1] - a[1]).slice(0, 8);
+    const sorted = getTopGroupedTotals(filtered, groupLabel, 8);
     chart.chartType = 'bar';
     chart.title = 'Top volume comparison';
     chart.subtitle = 'Comparison by plant';
-    chart.data = { labels: sorted.map((item) => item[0].length > 16 ? item[0].slice(0, 16) + '...' : item[0]), datasets: [{ label: 'kWh', data: sorted.map((item) => item[1]), color: '#3b82f6' }] };
+    chart.data = {
+      labels: sorted.map((item) => (item[0].length > 16 ? item[0].slice(0, 16) + '...' : item[0])),
+      datasets: [{ label: 'kWh', data: sorted.map((item) => item[1]), color: '#3b82f6' }],
+    };
     chart.table = { headers: ['Plant', 'Total'], rows: sorted.map((item) => [item[0], item[1]]) };
     return chart;
   }
 
-  if (/breakdown|distribution|share|pie|percent/i.test(lower)) {
-    const categoryTotals = { generation: 0, consumption: 0 };
-    filtered.forEach((row) => {
-      if (['101', '102'].includes(row.movementType)) categoryTotals.generation += row.quantity;
-      if (['261', '262'].includes(row.movementType)) categoryTotals.consumption += row.quantity;
-    });
+  if (requestedChartType === 'pie' || /breakdown|distribution|share|pie|percent/i.test(lower)) {
+    const categoryTotals = getSeriesTotals(filtered);
     chart.chartType = 'pie';
-    chart.title = `Volume Breakdown${plant ? ` for ${plant}` : city ? ` for ${city}` : ''}`;
+    chart.title = `Volume Breakdown${subjectLabel ? ` for ${subjectLabel}` : ''}`;
     chart.subtitle = 'Generation vs Consumption share';
     chart.data = {
       labels: ['Generation', 'Consumption'],
-      datasets: [{ label: 'Share', data: [categoryTotals.generation, categoryTotals.consumption], colors: ['#10b981', '#f43f5e'] }]
+      datasets: [{ label: 'Share', data: [categoryTotals.generation, categoryTotals.consumption], colors: ['#10b981', '#f43f5e'] }],
     };
     chart.table = { headers: ['Category', 'Value'], rows: [['Generation', categoryTotals.generation], ['Consumption', categoryTotals.consumption]] };
     return chart;
   }
 
+  chart.chartType = 'line';
+  chart.title = subjectLabel ? `Trend for ${subjectLabel}` : 'Generation vs Consumption Trend';
+  chart.subtitle = 'Trend over time';
+  chart.data = {
+    labels,
+    datasets: [
+      { label: 'Generation', data: generationSeries, color: '#10b981' },
+      { label: 'Consumption', data: consumptionSeries, color: '#f43f5e' },
+    ],
+  };
+  chart.table = {
+    headers: ['Date', 'Generation', 'Consumption'],
+    rows: sortedDates.map((date) => [formatReadableDate(date), groupByDate[date].generation, groupByDate[date].consumption]),
+  };
+  return chart;
+}
+
+function extractMemoryNotes(historyItems = []) {
+  const notes = [];
+  const seen = new Set();
+  (historyItems || [])
+    .filter((item) => item && typeof item.content === 'string' && item.content.trim())
+    .forEach((item) => {
+      const content = item.content.trim();
+      const nameMatch = content.match(/(?:my name is|i am|i'm|call me)\s+([a-z][a-z' -]{1,30})/i);
+      if (nameMatch) {
+        const name = nameMatch[1].trim();
+        const key = `name:${name.toLowerCase()}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          notes.push(`The user's name is ${name}.`);
+        }
+      }
+    });
+  return notes;
+}
+
+function extractNameFromText(text = '') {
+  const match = String(text || '').match(/(?:my name is|i am|i'm|call me)\s+([a-z][a-z' -]{1,30})/i);
+  return match ? match[1].trim() : null;
+}
+
+function extractStoredName(historyItems = []) {
+  const memoryNotes = extractMemoryNotes(historyItems);
+  const nameNote = memoryNotes.find((note) => note.startsWith("The user's name is "));
+  if (!nameNote) return null;
+  return nameNote.replace("The user's name is ", '').replace('.', '').trim();
+}
+
+function getDirectMemoryReply(message, historyItems = []) {
+  const lower = String(message || '').trim().toLowerCase();
+  const currentName = extractNameFromText(message);
+  const storedName = currentName || extractStoredName(historyItems);
+  if (!storedName) return null;
+
+  if (/^what is my name\??$/i.test(lower) || /^who am i\??$/i.test(lower) || /^what's my name\??$/i.test(lower) || /^what is my name \??$/i.test(lower)) {
+    return `Your name is ${storedName}.`;
+  }
+  if (/^my name is/i.test(lower) || /(?:^|\s)(?:i am|i'm|call me)\s+/i.test(lower)) {
+    return `Nice to meet you, ${storedName}.`;
+  }
   return null;
 }
 
-function createNumberFormatter(value) {
-  if (value === null || value === undefined) return '0';
-  if (value >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
-  if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
-  if (value >= 1e3) return `${(value / 1e3).toFixed(1)}k`;
-  return value.toLocaleString();
-}
-
-function loadDashboardRows() {
-  return new Promise((resolve, reject) => {
-    const results = [];
-    fs.createReadStream(csvFilePath)
-      .pipe(csv())
-      .on('data', (data) => {
-        const date = (data.POSTING_DATE_KEY || '').trim();
-        const movementType = (data.MOVEMENT_TYPE || '').trim();
-        if (!date || !movementType) return;
-
-        results.push({
-          date,
-          movementType,
-          quantity: parseFloat(data.QUANTITY) || 0,
-          plantName: data.SENDER_PLANT_NAME || '',
-          city: data.SENDER_PLANT_CITY || '',
-          material: data.MATERIAL_KEY || '',
-          senderPlantKey: data.SENDER_PLANT_KEY || '',
-        });
-      })
-      .on('end', () => {
-        dashboardRows = results;
-        resolve(results);
-      })
-      .on('error', reject);
-  });
-}
-
-function getRelevantRows(question, rows) {
+async function getRelevantRows(question) {
   const normalizedQuestion = question.toLowerCase();
   const requestedDate = extractRequestedDate(question);
   const movementTypes = extractMovementTypeFilter(question);
@@ -388,34 +755,67 @@ function getRelevantRows(question, rows) {
     .split(/[^a-z0-9]+/)
     .filter((word) => word.length > 2 && !stopWords.has(word));
 
-  const filteredRows = rows.filter((row) => {
-    if (requestedDate && row.date !== requestedDate) return false;
-    if (movementTypes.length && !movementTypes.includes(row.movementType)) return false;
+  let query = `
+    SELECT 
+      f.posting_date_key::text as date, 
+      f.movement_type::text as "movementType", 
+      f.quantity, 
+      p.name1 as "plantName", 
+      p.ort01 as city, 
+      f.material_key as material, 
+      f.sender_plant_key as "senderPlantKey"
+    FROM fact_quality_material_movement f
+    LEFT JOIN plant_master p ON f.sender_plant_key = p.werks
+    WHERE 1=1
+  `;
+  const values = [];
+  let paramCount = 1;
 
-    if (!keywordTerms.length) return true;
+  if (requestedDate) {
+    query += ` AND f.posting_date_key::text = $${paramCount++}`;
+    values.push(requestedDate);
+  }
+  
+  if (movementTypes.length > 0) {
+    query += ` AND f.movement_type::text = ANY($${paramCount++})`;
+    values.push(movementTypes);
+  }
 
-    const rowText = normalizeText(`${row.plantName} ${row.city} ${row.material} ${row.movementType} ${row.senderPlantKey}`);
-    const keywordHits = keywordTerms.reduce((sum, term) => sum + (rowText.includes(term) ? 1 : 0), 0);
-    return keywordHits > 0 || requestedDate || movementTypes.length;
-  });
-
-  if (!filteredRows.length) {
-    return [];
+  // Only apply keyword ILIKE filter when we have no date/movementType filters.
+  // If a date or movement type is already specified, keyword matching can
+  // accidentally produce zero results (e.g. "generated" is a keyword term that
+  // doesn't exist in any text column, yet movement_type is already filtered).
+  if (keywordTerms.length > 0 && !requestedDate && movementTypes.length === 0) {
+    const conditions = [];
+    for (const term of keywordTerms) {
+      conditions.push(`
+        (p.name1 ILIKE $${paramCount} OR 
+         p.ort01 ILIKE $${paramCount} OR 
+         f.material_key ILIKE $${paramCount} OR 
+         f.sender_plant_key ILIKE $${paramCount})
+      `);
+      values.push(`%${term}%`);
+      paramCount++;
+    }
+    query += ` AND (${conditions.join(' OR ')})`;
   }
 
   const isAscending = /lowest|minimum|smallest|least/i.test(normalizedQuestion);
   const isDescending = /highest|maximum|largest|top|most|peak/i.test(normalizedQuestion);
 
-  const sortedRows = [...filteredRows].sort((a, b) => {
-    if (isAscending) return a.quantity - b.quantity;
-    if (isDescending) return b.quantity - a.quantity;
-    return b.date.localeCompare(a.date) || b.quantity - a.quantity;
-  });
+  if (isAscending) {
+    query += ` ORDER BY f.quantity ASC`;
+  } else if (isDescending) {
+    query += ` ORDER BY f.quantity DESC`;
+  } else {
+    query += ` ORDER BY f.posting_date_key DESC, f.quantity DESC`;
+  }
+  
+  query += ` LIMIT 8`;
 
-  return sortedRows.slice(0, 8);
+  const { rows } = await pool.query(query, values);
+  return rows.map(rowToDashboardRecord);
 }
-
-// Note: direct-answer shortcut removed — all chat requests go through Ollama RAG now.
 
 app.use(cors());
 app.use(express.json());
@@ -429,33 +829,222 @@ app.get('/api/ping', (req, res) => {
   return res.json({ status: 'ok', message: 'Backend is running', uptime: process.uptime() });
 });
 
-app.get('/api/data', (req, res) => {
-  return res.json(dashboardRows);
+app.get('/api/filter-options', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT DISTINCT name1 as "plantName", ort01 as city
+      FROM plant_master
+      WHERE name1 IS NOT NULL OR ort01 IS NOT NULL
+      ORDER BY name1 ASC, ort01 ASC
+    `);
+
+    res.json({
+      plants: [...new Set(rows.map((row) => row.plantName).filter(Boolean))].sort(),
+      cities: [...new Set(rows.map((row) => row.city).filter(Boolean))].sort(),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/data', async (req, res) => {
+  try {
+    const values = [];
+    let paramCount = 1;
+    let query = `
+      SELECT 
+        f.posting_date_key::text as date, 
+        f.movement_type::text as "movementType", 
+        f.quantity, 
+        p.name1 as "plantName", 
+        p.ort01 as city, 
+        f.material_key as material, 
+        f.sender_plant_key as "senderPlantKey"
+      FROM fact_quality_material_movement f
+      LEFT JOIN plant_master p ON f.sender_plant_key = p.werks
+      WHERE f.movement_type::text IN ('101', '102', '261', '262')
+    `;
+
+    const entityFilterStart = query;
+    ({ query, paramCount } = appendEntityFilters(query, values, paramCount, {
+      plant: req.query.plant,
+      city: req.query.city,
+    }));
+
+    let entityWhere = query.replace(entityFilterStart, '');
+    const latestDate = await getLatestPostingDate(entityWhere, values);
+    const dateRange = req.query.dateRange || 'All';
+    const dateFilter = getDateRangeClause(dateRange, latestDate, values, paramCount);
+    query += dateFilter.clause;
+    paramCount = dateFilter.paramCount;
+
+    query += `
+      ORDER BY f.posting_date_key DESC
+    `;
+
+    const { rows } = await pool.query(query, values);
+    res.json(rows.map(rowToDashboardRecord));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/trend', async (req, res) => {
+  try {
+    const values = [];
+    let paramCount = 1;
+    let query = `
+      SELECT
+        f.posting_date_key::text as date,
+        SUM(CASE WHEN f.movement_type::text IN ('101', '102') THEN f.quantity ELSE 0 END) as generation,
+        SUM(CASE WHEN f.movement_type::text IN ('261', '262') THEN f.quantity ELSE 0 END) as consumption
+      FROM fact_quality_material_movement f
+      LEFT JOIN plant_master p ON f.sender_plant_key = p.werks
+      WHERE f.movement_type::text IN ('101', '102', '261', '262')
+    `;
+
+    const entityFilterStart = query;
+    ({ query, paramCount } = appendEntityFilters(query, values, paramCount, {
+      plant: req.query.plant,
+      city: req.query.city,
+    }));
+
+    const entityWhere = query.replace(entityFilterStart, '');
+    const latestDate = await getLatestPostingDate(entityWhere, values);
+    const dateFilter = getDateRangeClause(req.query.dateRange || 'All', latestDate, values, paramCount);
+    query += dateFilter.clause;
+    paramCount = dateFilter.paramCount;
+
+    query += `
+      GROUP BY f.posting_date_key::text
+      ORDER BY f.posting_date_key::text ASC
+    `;
+
+    const { rows } = await pool.query(query, values);
+    const trendRows = rows.map((row) => ({
+      date: String(row.date || ''),
+      generation: parseFloat(row.generation || 0),
+      consumption: parseFloat(row.consumption || 0),
+    }));
+
+    res.json(trendRows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.post('/api/chat', async (req, res) => {
   try {
     const message = req.body?.message ?? req.body?.question ?? '';
+    const history = Array.isArray(req.body?.history) ? req.body.history : [];
+    const rawMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    const sessionId = req.body?.sessionId || 'default-session';
+
     if (typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ error: 'Message is required.' });
     }
 
     console.log(`\n📝 Chat Request: "${message}"`);
 
+    const normalizeHistoryItems = (historyItems = []) => {
+      return (historyItems || [])
+        .filter((item) => item && typeof item === 'object')
+        .map((item) => {
+          if (item.role && ['system', 'user', 'assistant'].includes(item.role)) {
+            return { role: item.role, content: String(item.content || '').trim() };
+          }
+          if (item.sender === 'user') {
+            return { role: 'user', content: String(item.text || item.content || '').trim() };
+          }
+          if (item.sender === 'bot' || item.role === 'assistant') {
+            return { role: 'assistant', content: String(item.text || item.content || '').trim() };
+          }
+          return null;
+        })
+        .filter((item) => item && item.content);
+    };
+
     const isDashboardQuery = detectDashboardQuery(message);
-    const chartResponse = isDashboardQuery && detectChartIntent(message) ? buildChartResponse(message, dashboardRows) : null;
-    if (chartResponse) {
-      console.log('✅ Detected dashboard chart intent; returning structured chart payload');
-      return res.json(chartResponse);
+    const wantsChart = detectChartIntent(message);
+
+    if (wantsChart) {
+      const normalizedHistory = normalizeHistoryItems(rawMessages.length ? rawMessages : history);
+      
+      const session = updateSessionState(sessionId, message, cachedPlantNames, cachedCities, normalizedHistory);
+      const { plant: resolvedPlant, city: resolvedCity, source } = resolveContextFromSession(message, session);
+      
+      const pronounRef = referencesPreviousSubject(message);
+      const explicitInMessage = findExplicitPlantMention(message, cachedPlantNames);
+
+      console.log(`[chart] message="${message}" sessionId="${sessionId}"`);
+      console.log(`[chart] resolvedPlant=${resolvedPlant || 'none'} resolvedCity=${resolvedCity || 'none'} source=${source} pronounRef=${pronounRef}`);
+
+      if (pronounRef && !resolvedPlant && !resolvedCity) {
+        return res.json({
+          type: 'text',
+          message: 'Could you please specify which plant or region you are referring to?',
+        });
+      }
+
+      const mentionsUnknownPlant = !explicitInMessage
+        && !pronounRef
+        && !resolvedPlant
+        && /\b(for|about|named|called)\s+(the\s+)?plant\b|\bplant\s+["']?[a-z0-9]/i.test(message)
+        && !/\b(by|per|top|all)\s+plants?\b/i.test(message);
+      if (mentionsUnknownPlant) {
+        const suggestions = findClosestPlants(message, cachedPlantNames, 3);
+        console.log(`[chart] Plant not found. Suggestions: ${suggestions.join(', ')}`);
+        return res.json({
+          type: 'text',
+          message: `Plant not found. Did you mean: ${suggestions.join(', ')}?`,
+        });
+      }
+
+      const chartResponse = await buildChartResponse(message, resolvedPlant, resolvedCity);
+      if (chartResponse) {
+        console.log(`✅ Chart generated for plant="${chartResponse.plant || 'ALL PLANTS'}" city="${resolvedCity || 'ALL CITIES'}"`);
+        return res.json(chartResponse);
+      }
+
+      if (resolvedPlant || resolvedCity) {
+        const entity = resolvedPlant || resolvedCity;
+        console.log(`⚠️ No chart data available for resolved entity="${entity}"`);
+        return res.json({
+          type: 'text',
+          message: `No chart data available for ${entity} with the current filters.`,
+        });
+      }
     }
 
-    const callGeneralOllama = async (promptText) => {
-      const response = await fetch('http://localhost:11434/api/generate', {
+    const buildConversationMessages = (historyItems = [], currentMessage, systemPrompt = '') => {
+      const normalizedHistory = normalizeHistoryItems(historyItems).slice(-18);
+      const memoryNotes = extractMemoryNotes(normalizedHistory);
+      const effectiveSystemPrompt = [systemPrompt, memoryNotes.length ? `Memory notes:\n- ${memoryNotes.join('\n- ')}` : ''].filter(Boolean).join('\n\n');
+      const messages = [];
+      if (effectiveSystemPrompt) {
+        messages.push({ role: 'system', content: effectiveSystemPrompt });
+      }
+
+      messages.push(...normalizedHistory);
+      if (typeof currentMessage === 'string' && currentMessage.trim()) {
+        const latest = normalizedHistory[normalizedHistory.length - 1];
+        const currentText = currentMessage.trim();
+        const isDuplicate = latest && latest.role === 'user' && latest.content === currentText;
+        if (!isDuplicate) {
+          messages.push({ role: 'user', content: currentText });
+        }
+      }
+
+      return messages;
+    };
+
+    const callGeneralOllama = async (messages) => {
+      const response = await fetch('http://localhost:11434/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: 'llama3.2',
-          prompt: promptText,
+          messages,
           stream: false,
         }),
       });
@@ -467,7 +1056,7 @@ app.post('/api/chat', async (req, res) => {
       }
 
       const data = await response.json();
-      const text = typeof data?.response === 'string' ? data.response.trim() : '';
+      const text = typeof data?.message?.content === 'string' ? data.message.content.trim() : '';
       if (!text) {
         console.error('❌ Ollama returned empty response');
         throw new Error('Empty Ollama response');
@@ -475,29 +1064,38 @@ app.post('/api/chat', async (req, res) => {
       return text;
     };
 
+    const directMemoryReply = getDirectMemoryReply(message, rawMessages.length ? rawMessages : history);
+    if (directMemoryReply) {
+      console.log('🧠 Direct memory reply triggered');
+      return res.type('text/plain').send(directMemoryReply);
+    }
+
     if (isDashboardQuery) {
-      console.log('🔄 Dashboard query detected; searching CSV for relevant rows');
-      const relevantRows = getRelevantRows(message, dashboardRows);
+      console.log('🔄 Dashboard query detected; searching PostgreSQL for relevant rows');
+      const relevantRows = await getRelevantRows(message);
       if (relevantRows.length) {
-        console.log(`   Found ${relevantRows.length} relevant CSV rows for context`);
+        console.log(`   Found ${relevantRows.length} relevant PostgreSQL rows for context`);
         const contextText = relevantRows.map((row, index) => {
           const readableDate = formatReadableDate(row.date);
           return `${index + 1}. Date: ${readableDate} | Movement type: ${row.movementType} | Quantity: ${row.quantity} | Plant: ${row.plantName || 'unknown'} | City: ${row.city || 'unknown'} | Material: ${row.material || 'unknown'}`;
         }).join('\n');
 
-        const prompt = `You are a factual assistant. Answer ONLY using the CSV rows provided below. Do not use outside knowledge. If the requested information is not present in the provided rows, reply with the best possible answer based on the data provided.\n\nCSV rows:\n${contextText}\n\nQuestion: ${message}\nAnswer in one short sentence.`;
+        const systemPrompt = `You are a factual assistant. The conversation messages below are your memory. Treat them as the complete conversation history and use them to answer follow-up questions accurately. Never say you cannot remember previous messages when they are present in the provided history. Keep replies brief, natural, and directly focused on the user's request. Answer ONLY using the PostgreSQL rows provided below. Do not use outside knowledge. If the requested information is not present in the provided rows, reply with the best possible answer based on the data provided.\n\nDatabase rows:\n${contextText}\n\nAnswer in one short sentence.`;
+        const conversationMessages = buildConversationMessages(rawMessages.length ? rawMessages : history, message, systemPrompt);
 
-        console.log('   🤖 Calling Ollama for dashboard answer with CSV context');
-        const responseText = await callGeneralOllama(prompt);
+        console.log('   🤖 Calling Ollama for dashboard answer with SQL context');
+        const responseText = await callGeneralOllama(conversationMessages);
         console.log('✅ [OLLAMA RESPONSE] Received dashboard answer from Ollama');
         return res.type('text/plain').send(responseText);
       }
 
-      console.log('🔁 No relevant CSV data found for dashboard query; falling back to general Ollama knowledge');
+      console.log('🔁 No relevant PostgreSQL data found for dashboard query; falling back to general Ollama knowledge');
     }
 
     console.log('🔄 Delegating to Ollama for general knowledge response');
-    const generalText = await callGeneralOllama(message);
+    const generalSystemPrompt = 'You are a helpful assistant. The conversation messages below are your memory. Treat them as the complete conversation history and use them to answer follow-up questions accurately and concisely. Never say you cannot remember previous messages when they are present in the provided history. Keep replies brief, natural, and directly focused on the user ask.';
+    const generalMessages = buildConversationMessages(rawMessages.length ? rawMessages : history, message, generalSystemPrompt);
+    const generalText = await callGeneralOllama(generalMessages);
     console.log('✅ [OLLAMA RESPONSE] Received general answer from Ollama');
     return res.type('text/plain').send(generalText);
   } catch (error) {
@@ -510,11 +1108,6 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Route not found', path: req.originalUrl });
 });
 
-loadDashboardRows()
-  .then(() => {
-    app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
-  })
-  .catch((error) => {
-    console.error('Failed to load dashboard CSV:', error);
-    process.exit(1);
-  });
+initDbCache().then(() => {
+  app.listen(PORT, () => console.log(`Backend running on port ${PORT} connected to PostgreSQL`));
+}).catch(console.error);
