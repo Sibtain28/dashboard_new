@@ -4,10 +4,18 @@ const path = require('path');
 const dotenv = require('dotenv');
 const { Pool } = require('pg');
 
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { OAuth2Client } = require('google-auth-library');
+
 dotenv.config();
 
 const app = express();
+app.use(express.json());
 const PORT = process.env.PORT || 3001;
+
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
 
 // PostgreSQL connection pool
 const pool = new Pool({
@@ -257,9 +265,9 @@ function updateSessionState(sessionId, message, plantNames, cities, historyItems
   }
 
   const session = activeSessions.get(sessionId);
-  
+
   let explicitPlant = findExplicitPlantMention(message, plantNames);
-  
+
   if (!explicitPlant && historyItems) {
     for (let i = historyItems.length - 1; i >= 0; i -= 1) {
       const text = historyItems[i]?.content || historyItems[i]?.text || '';
@@ -270,7 +278,7 @@ function updateSessionState(sessionId, message, plantNames, cities, historyItems
 
   if (explicitPlant) {
     session.currentPlant = explicitPlant;
-    session.currentCity = null; 
+    session.currentCity = null;
   }
 
   let explicitCity = identityMatch(message, cities);
@@ -284,34 +292,34 @@ function updateSessionState(sessionId, message, plantNames, cities, historyItems
 
   if (explicitCity && !explicitPlant) {
     session.currentCity = explicitCity;
-    session.currentPlant = null; 
+    session.currentPlant = null;
   }
 
   const explicitDate = extractRequestedDate(message);
   if (explicitDate) {
     session.currentDate = explicitDate;
   }
-  
+
   return session;
 }
 
 function resolveContextFromSession(message, session) {
   if (!session) return { plant: null, city: null, source: 'none' };
-  
+
   const isReferencingPrevious = referencesPreviousSubject(message);
-  
+
   if (isReferencingPrevious) {
-    return { 
-      plant: session.currentPlant, 
-      city: session.currentCity, 
-      source: 'session_reference' 
+    return {
+      plant: session.currentPlant,
+      city: session.currentCity,
+      source: 'session_reference'
     };
   }
 
-  return { 
-    plant: session.currentPlant, 
-    city: session.currentCity, 
-    source: session.currentPlant || session.currentCity ? 'current_state' : 'none' 
+  return {
+    plant: session.currentPlant,
+    city: session.currentCity,
+    source: session.currentPlant || session.currentCity ? 'current_state' : 'none'
   };
 }
 
@@ -470,7 +478,14 @@ async function buildChartResponse(question, resolvedPlant, resolvedCity) {
   const wantCon = /consumption|consumed|used/i.test(lower);
   const wantBoth = /compare|comparison|vs|versus/i.test(lower) || /generation.*consumption|consumption.*generation/i.test(lower);
 
-  if (wantBoth) {
+  // Gauge charts always need BOTH categories pulled from the DB so the max
+  // can be sized against real generation/consumption totals. Without this,
+  // a single-category query (e.g. "consumption gauge") only ever fetches
+  // consumption rows, generation comes back as 0, and the gauge's max ends
+  // up equal to its own value — pegging the needle at 100% every time.
+  if (requestedChartType === 'gauge') {
+    query += ` AND f.movement_type::text IN ('101', '102', '261', '262')`;
+  } else if (wantBoth) {
     query += ` AND f.movement_type::text IN ('101', '102', '261', '262')`;
   } else if (wantGen && !wantCon) {
     query += ` AND f.movement_type::text IN ('101', '102')`;
@@ -553,10 +568,20 @@ async function buildChartResponse(question, resolvedPlant, resolvedCity) {
       : wantBoth
         ? totals.generation - totals.consumption
         : totals.generation;
-    const max = Math.max(totals.generation, totals.consumption, Math.abs(value), 1);
+
+    // Reference max is the larger of the two real totals (now both are
+    // populated since the query above always includes both categories for
+    // gauge charts), with 15% headroom so the arc/needle has visual room to
+    // move instead of always reading pegged at 100%.
+    const referenceMax = Math.max(totals.generation, totals.consumption, Math.abs(value), 1);
+    const max = referenceMax * 1.15;
+    
+
     chart.chartType = 'gauge';
     chart.title = `Gauge${subjectLabel ? ` for ${subjectLabel}` : ''}`;
-    chart.subtitle = wantBoth ? 'Net generation against highest category total' : 'Selected category against observed maximum';
+    chart.subtitle = wantBoth
+      ? 'Net generation against highest category total'
+      : 'Selected category against generation/consumption peak';
     chart.data = {
       labels: ['Value'],
       datasets: [{ label: wantBoth ? 'Net Difference' : (wantCon ? 'Consumption' : 'Generation'), data: [value], max, color: value >= 0 ? '#10b981' : '#f43f5e' }],
@@ -564,6 +589,7 @@ async function buildChartResponse(question, resolvedPlant, resolvedCity) {
     chart.table = { headers: ['Metric', 'Value'], rows: [['Generation', totals.generation], ['Consumption', totals.consumption], ['Net', totals.generation - totals.consumption]] };
     return chart;
   }
+  
 
   if (requestedChartType === 'histogram') {
     const quantities = filtered.map((row) => row.quantity).filter((value) => Number.isFinite(value));
@@ -775,7 +801,7 @@ async function getRelevantRows(question) {
     query += ` AND f.posting_date_key::text = $${paramCount++}`;
     values.push(requestedDate);
   }
-  
+
   if (movementTypes.length > 0) {
     query += ` AND f.movement_type::text = ANY($${paramCount++})`;
     values.push(movementTypes);
@@ -810,7 +836,7 @@ async function getRelevantRows(question) {
   } else {
     query += ` ORDER BY f.posting_date_key DESC, f.quantity DESC`;
   }
-  
+
   query += ` LIMIT 8`;
 
   const { rows } = await pool.query(query, values);
@@ -933,18 +959,100 @@ app.get('/api/trend', async (req, res) => {
   }
 });
 
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', authenticateToken, async (req, res) => {
   try {
     const message = req.body?.message ?? req.body?.question ?? '';
     const history = Array.isArray(req.body?.history) ? req.body.history : [];
     const rawMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
-    const sessionId = req.body?.sessionId || 'default-session';
+    const sessionId = req.body?.sessionId;
 
     if (typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ error: 'Message is required.' });
     }
 
     console.log(`\n📝 Chat Request: "${message}"`);
+
+    const generateTitleAsync = async (sessionId, userMessage) => {
+      try {
+        if (/^(hi|hello|hey|thanks|can you help me\??)$/i.test(userMessage.trim())) {
+          return; // Ignore generic greetings
+        }
+        
+        // Ensure message is somewhat meaningful
+        if (userMessage.length < 5) return;
+
+        console.log(`🧠 Generating chat title for session: ${sessionId}`);
+        const response = await fetch('http://localhost:11434/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'llama3.2',
+            messages: [{
+              role: 'user', 
+              content: `Generate a concise, 3 to 6 word title summarizing this message. Use sentence case. Do not use quotes or trailing punctuation. Respond ONLY with the title. Message: "${userMessage}"`
+            }],
+            stream: false,
+          }),
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          let title = data?.message?.content?.trim();
+          if (title) {
+            // Remove any surrounding quotes just in case
+            title = title.replace(/^["']|["']$/g, '');
+            // Sentence case
+            title = title.charAt(0).toUpperCase() + title.slice(1);
+            
+            await pool.query('UPDATE chat_sessions SET title = $1 WHERE id = $2', [title, sessionId]);
+            console.log(`✅ Title updated to: "${title}"`);
+          }
+        }
+      } catch (e) {
+        console.error('❌ Failed to generate chat title:', e.message);
+      }
+    };
+
+    const saveMessage = async (role, content) => {
+      try {
+        if (sessionId && req.user && req.user.userId) {
+          // Verify session belongs to user
+          const sessionCheck = await pool.query('SELECT id, title FROM chat_sessions WHERE id = $1 AND user_id = $2', [sessionId, req.user.userId]);
+          if (sessionCheck.rows.length > 0) {
+            const contentStr = typeof content === 'string' ? content : JSON.stringify(content);
+            await pool.query('INSERT INTO chat_messages (session_id, role, content, created_at) VALUES ($1, $2, $3, NOW())', [sessionId, role, contentStr]);
+            await pool.query('UPDATE chat_sessions SET updated_at = NOW() WHERE id = $1', [sessionId]);
+            
+            // If it's a user message and the session title is still the default "New Chat"
+            if (role === 'user' && sessionCheck.rows[0].title === 'New Chat') {
+              generateTitleAsync(sessionId, typeof content === 'string' ? content : (content.text || ''));
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Error saving chat message to DB', e);
+      }
+    };
+
+    // Save the user's incoming message asynchronously
+    saveMessage('user', message);
+
+    // Intercept response to save the assistant's reply
+    const originalJson = res.json;
+    res.json = function (body) {
+      if (res.statusCode === 200 && !body.error) {
+        saveMessage('assistant', body);
+      }
+      return originalJson.call(this, body);
+    };
+
+    const originalSend = res.send;
+    res.send = function (body) {
+      if (res.statusCode === 200 && res.get('Content-Type')?.includes('text/plain')) {
+        saveMessage('assistant', body);
+      }
+      return originalSend.call(this, body);
+    };
 
     const normalizeHistoryItems = (historyItems = []) => {
       return (historyItems || [])
@@ -969,10 +1077,10 @@ app.post('/api/chat', async (req, res) => {
 
     if (wantsChart) {
       const normalizedHistory = normalizeHistoryItems(rawMessages.length ? rawMessages : history);
-      
+
       const session = updateSessionState(sessionId, message, cachedPlantNames, cachedCities, normalizedHistory);
       const { plant: resolvedPlant, city: resolvedCity, source } = resolveContextFromSession(message, session);
-      
+
       const pronounRef = referencesPreviousSubject(message);
       const explicitInMessage = findExplicitPlantMention(message, cachedPlantNames);
 
@@ -1101,6 +1209,209 @@ app.post('/api/chat', async (req, res) => {
   } catch (error) {
     console.error('❌ Chat handler failure:', error.message);
     return res.status(503).json({ error: 'Ollama is not available. Please make sure Ollama is running.' });
+  }
+});
+
+// --- Authentication Middleware ---
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Access denied, token missing' });
+
+  jwt.verify(token, process.env.JWT_SECRET || 'secret123', (err, user) => {
+    if (err) return res.status(403).json({ error: 'Invalid token' });
+    req.user = user; // Has userId
+    next();
+  });
+}
+
+// --- Chat Session Routes ---
+
+// Get all sessions for the authenticated user
+app.get('/api/chat/sessions', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM chat_sessions WHERE user_id = $1 ORDER BY updated_at DESC',
+      [req.user.userId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching chat sessions:', error);
+    res.status(500).json({ error: 'Server error fetching chat sessions' });
+  }
+});
+
+// Create a new session
+app.post('/api/chat/sessions', authenticateToken, async (req, res) => {
+  try {
+    const { title } = req.body;
+    const result = await pool.query(
+      'INSERT INTO chat_sessions (user_id, title, updated_at) VALUES ($1, $2, NOW()) RETURNING *',
+      [req.user.userId, title || 'New Chat']
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error creating chat session:', error);
+    res.status(500).json({ error: 'Server error creating chat session' });
+  }
+});
+
+// Get messages for a session
+app.get('/api/chat/sessions/:id', authenticateToken, async (req, res) => {
+  try {
+    // First, verify the session belongs to the user
+    const sessionCheck = await pool.query(
+      'SELECT id FROM chat_sessions WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.userId]
+    );
+
+    if (sessionCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const result = await pool.query(
+      'SELECT * FROM chat_messages WHERE session_id = $1 ORDER BY created_at ASC',
+      [req.params.id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching chat messages:', error);
+    res.status(500).json({ error: 'Server error fetching chat messages' });
+  }
+});
+
+// Delete a session (and its messages)
+app.delete('/api/chat/sessions/:id', authenticateToken, async (req, res) => {
+  try {
+    // Verify the session belongs to the user before deleting anything
+    const sessionCheck = await pool.query(
+      'SELECT id FROM chat_sessions WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.userId]
+    );
+
+    if (sessionCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    // Delete messages first (in case there's no ON DELETE CASCADE on the FK)
+    await pool.query('DELETE FROM chat_messages WHERE session_id = $1', [req.params.id]);
+
+    // Then delete the session itself
+    await pool.query('DELETE FROM chat_sessions WHERE id = $1 AND user_id = $2', [
+      req.params.id,
+      req.user.userId,
+    ]);
+
+    res.json({ success: true, id: req.params.id });
+  } catch (error) {
+    console.error('Error deleting chat session:', error);
+    res.status(500).json({ error: 'Server error deleting chat session' });
+  }
+});
+
+// --- Authentication Routes ---
+
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+
+    // Check if user exists
+    const userExists = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (userExists.rows.length > 0) {
+      return res.status(400).json({ error: 'User already exists' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    // Insert new user
+    const newUser = await pool.query(
+      'INSERT INTO users (full_name, email, password_hash, provider) VALUES ($1, $2, $3, $4) RETURNING *',
+      [name, email, hashedPassword, 'local']
+    );
+    const user = newUser.rows[0];
+
+    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET || 'secret123', { expiresIn: '7d' });
+    res.json({ token, user: { id: user.id, name: user.full_name, email: user.email } });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Server error during registration' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (userResult.rows.length === 0) {
+      return res.status(400).json({ error: 'Invalid credentials' });
+    }
+    const user = userResult.rows[0];
+
+    if (!user.password_hash) {
+      return res.status(400).json({ error: 'Please login using Google' });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password_hash);
+    if (!isMatch) {
+      return res.status(400).json({ error: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET || 'secret123', { expiresIn: '7d' });
+    res.json({ token, user: { id: user.id, name: user.full_name, email: user.email } });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Server error during login' });
+  }
+});
+
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { credential } = req.body;
+
+    // For local testing without a real client ID, we can optionally bypass verification
+    // if the token is a dummy token. But ideally we verify it.
+    let payload;
+    if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_ID !== '908493608865-86vpn3vdr2ap3puh948vuch10sn9mkuo') {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: credential,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
+      payload = ticket.getPayload();
+    } else {
+      // Mock payload for testing without setting up Google Client ID
+      payload = {
+        sub: '1234567890',
+        email: 'mockuser@example.com',
+        name: 'Mock Google User'
+      };
+    }
+
+    const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [payload.email]);
+    let user;
+    if (userResult.rows.length === 0) {
+      const newUser = await pool.query(
+        'INSERT INTO users (full_name, email, google_id, provider) VALUES ($1, $2, $3, $4) RETURNING *',
+        [payload.name, payload.email, payload.sub, 'google']
+      );
+      user = newUser.rows[0];
+    } else {
+      user = userResult.rows[0];
+      if (!user.google_id) {
+        const updatedUser = await pool.query(
+          'UPDATE users SET google_id = $1 WHERE id = $2 RETURNING *',
+          [payload.sub, user.id]
+        );
+        user = updatedUser.rows[0];
+      }
+    }
+
+    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET || 'secret123', { expiresIn: '7d' });
+    res.json({ token, user: { id: user.id, name: user.full_name, email: user.email } });
+  } catch (error) {
+    console.error('Google auth error:', error);
+    res.status(401).json({ error: 'Invalid Google token' });
   }
 });
 

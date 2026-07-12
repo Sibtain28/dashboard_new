@@ -976,8 +976,18 @@ function Dashboard() {
     { type: '262', category: 'Consumption', qty: mTypeData['262'], color: '#f43f5e' },
   ];
   if (loading) {
-    return <div className="loading"><RefreshCw className="spinner" size={32} /> Loading Enterprise Dashboard...</div>;
-  }
+  return (
+    <div className="loading-screen">
+      <div className="loading-spinner">
+        <div className="loading-spinner-ring"></div>
+        <div className="loading-spinner-ring"></div>
+        <Zap className="loading-spinner-icon" size={22} />
+      </div>
+      <div className="loading-text">Loading Enterprise Dashboard</div>
+      <div className="loading-subtext">Fetching plant generation and consumption data...</div>
+    </div>
+  );
+}
 
   return (
     <div className="dashboard-container">
@@ -985,7 +995,7 @@ function Dashboard() {
       <header className="dashboard-header">
         <div className="header-title">
           <h1>Power Plant Analytics</h1>
-          <p>Enterprise Generation vs Consumption Dashboard</p>
+          <p>Generation vs Consumption Dashboard</p>
           <div className="last-updated">
             <Clock size={12} /> Last Updated: {lastUpdated}
           </div>
@@ -1164,8 +1174,6 @@ function Dashboard() {
         </div>
       </div>
       {/* END ROW 3 */}
-      {/* AI Chatbot */}
-      <Chatbot />
     </div>
   );
 }
