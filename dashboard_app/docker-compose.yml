@@ -1,0 +1,37 @@
+services:
+  # The frontend React application built with Vite
+  frontend:
+    build:
+      context: ./frontend
+    container_name: dashboard-frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:3001
+    depends_on:
+      backend:
+        condition: service_started
+    networks:
+      - dashboard-net
+
+  # The backend Node.js application
+  backend:
+    build:
+      context: ./backend
+    container_name: dashboard-backend
+    ports:
+      - "3001:3001"
+    environment:
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5433
+      - DB_USER=postgres
+      - DB_PASSWORD=sibtain@2006
+      - DB_NAME=power_dashboard
+      # Points to the native macOS Ollama (with Metal GPU) instead of the slow CPU container
+      - OLLAMA_URL=http://host.docker.internal:11434
+    networks:
+      - dashboard-net
+
+networks:
+  dashboard-net:
+    driver: bridge

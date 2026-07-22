@@ -17,6 +17,7 @@ import {
 } from 'recharts';
 import { Mic, MicOff, Volume2, VolumeX, MessageSquare, Send, Plus, Menu, PanelLeftClose, PanelLeftOpen, Trash2, Search } from 'lucide-react';
 import './ChatbotPage.css';
+import DashboardWidgetWrapper from './components/dashboard/DashboardWidgetWrapper';
 
 const formatLargeNumber = (value) => {
   if (value === null || value === undefined) return '0 kWh';
@@ -349,6 +350,9 @@ function ChatbotPage() {
           if (msg.role === 'user') {
             return { sender: 'user', type: 'text', text: typeof content === 'string' ? content : content.text };
           } else {
+            if (content && content.type === 'dashboard_component') {
+              return { sender: 'bot', type: 'dashboard_component', components: content.components, filters: content.filters };
+            }
             if (content && content.type === 'chart') {
               return { sender: 'bot', type: 'chart', chart: content };
             }
@@ -532,16 +536,22 @@ function ChatbotPage() {
 
       if (response.ok && contentType.includes('application/json')) {
         const payload = await response.json();
-        const chartPayload = payload?.type === 'chart'
+
+        const chartPayload = payload?.type === 'dashboard_component'
           ? payload
-          : payload?.chart?.type === 'chart'
-            ? payload.chart
-            : payload?.chartType && payload?.data
-              ? { ...payload, type: 'chart' }
-              : null;
-        if (chartPayload?.data) {
+          : payload?.type === 'chart'
+            ? payload
+            : payload?.chart?.type === 'chart'
+              ? payload.chart
+              : payload?.chartType && payload?.data
+                ? { ...payload, type: 'chart' }
+                : null;
+        if (payload?.type === 'dashboard_component') {
+          botMessage = { sender: 'bot', type: 'dashboard_component', components: payload.components, filters: payload.filters };
+        } else if (chartPayload?.data) {
           botMessage = { sender: 'bot', type: 'chart', chart: chartPayload };
         } else {
+
           const text = payload?.message || payload?.response || JSON.stringify(payload);
           botMessage = { sender: 'bot', type: 'text', text };
         }
@@ -719,11 +729,17 @@ function ChatbotPage() {
             messages.map((msg, idx) => (
               <div key={idx} className={`chat-page-message ${msg.sender} ${msg.type}`}>
                 <div className="message-content">
-                  {msg.type === 'chart' ? (
+
+                  {msg.type === 'dashboard_component' ? (
+                    <div style={{ width: '100%', overflow: 'hidden' }}>
+                      <DashboardWidgetWrapper components={msg.components} filters={msg.filters} />
+                    </div>
+                  ) : msg.type === 'chart' ? (
                     renderChartMessage(msg.chart)
                   ) : (
                     <div className="message-text">{msg.text}</div>
                   )}
+
                 </div>
               </div>
             ))

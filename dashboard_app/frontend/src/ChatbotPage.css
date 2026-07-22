@@ -294,6 +294,17 @@
 .chat-page-message.user .message-content { color: var(--text-primary); }
 .chat-page-message.bot .message-content { color: var(--text-secondary); }
 
+/* Override message container and content for dashboard components so they don't clip */
+.chat-page-message.dashboard_component {
+  width: 100%;
+}
+
+.chat-page-message.dashboard_component .message-content {
+  max-width: 100%;
+  width: 100%;
+  padding: 12px 0;
+}
+
 .chat-page-footer {
   padding: 24px 32px;
   background: var(--bg-color);

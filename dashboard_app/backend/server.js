@@ -19,12 +19,20 @@ const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // PostgreSQL connection pool
 const pool = new Pool({
-  user: "postgres",
-  host: "localhost",
-  database: "power_dashboard",
-  password: "sibtain@2006",
-  port: 5433,
+  user: process.env.DB_USER || "postgres",
+  host: process.env.DB_HOST || "localhost",
+  database: process.env.DB_NAME || "power_dashboard",
+  password: process.env.DB_PASSWORD || "sibtain@2006",
+  port: process.env.DB_PORT || 5433,
 });
+console.log({
+  DB_HOST: process.env.DB_HOST,
+  DB_PORT: process.env.DB_PORT,
+  DB_USER: process.env.DB_USER,
+  DB_NAME: process.env.DB_NAME,
+});
+
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 
 let cachedPlantNames = [];
 let cachedCities = [];
@@ -152,6 +160,12 @@ function normalizeText(value) {
     .trim();
 }
 
+// Parses a date mention from the user's message. Supports:
+//   - "today" / "yesterday"
+//   - Full formats: "17 June 2026", "June 17, 2026", "2026-06-17"
+//   - Year-omitted formats: "17th June", "17 June", "June 17"
+//     → when the year is missing, returns a special object { day, month }
+//     so the caller can look up the actual available year in the DB.
 function extractRequestedDate(question) {
   const lower = question.toLowerCase();
   const now = new Date();
@@ -171,59 +185,89 @@ function extractRequestedDate(question) {
     july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
   };
 
-  const patterns = [
-    /(\d{4})[-/](\d{1,2})[-/](\d{1,2})/,
-    /(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})/i,
-    /(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(\d{4})/i,
-    /(\d{1,2})[-/](\d{1,2})[-/](\d{4})/,
+  // Patterns that include an explicit year — handled first so they take priority.
+  const fullPatterns = [
+    { re: /(\d{4})[-/](\d{1,2})[-/](\d{1,2})/, parse: (m) => ({ year: +m[1], month: +m[2] - 1, day: +m[3] }) },
+    {
+      re: /(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})/i,
+      parse: (m) => ({ day: +m[1], month: monthMap[m[2].toLowerCase()], year: +m[3] })
+    },
+    {
+      re: /(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(\d{4})/i,
+      parse: (m) => ({ month: monthMap[m[1].toLowerCase()], day: +m[2], year: +m[3] })
+    },
+    { re: /(\d{1,2})[-/](\d{1,2})[-/](\d{4})/, parse: (m) => ({ month: +m[1] - 1, day: +m[2], year: +m[3] }) },
   ];
 
-  for (const pattern of patterns) {
-    const match = question.match(pattern);
-    if (!match) continue;
+  for (const { re, parse } of fullPatterns) {
+    const m = question.match(re);
+    if (!m) continue;
+    const { year, month, day } = parse(m);
+    if ([year, month, day].some(Number.isNaN)) continue;
+    return formatDateYYYYMMDD(new Date(Date.UTC(year, month, day)));
+  }
 
-    let year, month, day;
+  // Year-omitted patterns — return a sentinel object so the caller can
+  // infer the year from the DB (the year that actually has data for that day).
+  const partialPatterns = [
+    {
+      re: /(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)/i,
+      parse: (m) => ({ day: +m[1], month: monthMap[m[2].toLowerCase()] })
+    },
+    {
+      re: /(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?/i,
+      parse: (m) => ({ month: monthMap[m[1].toLowerCase()], day: +m[2] })
+    },
+  ];
 
-    if (pattern.source.startsWith('(\\d{4})')) {
-      year = parseInt(match[1], 10);
-      month = parseInt(match[2], 10) - 1;
-      day = parseInt(match[3], 10);
-    } else if (pattern.source.startsWith('(\\d{1,2})(?:st|nd|rd|th)?')) {
-      day = parseInt(match[1], 10);
-      month = monthMap[match[2].toLowerCase()];
-      year = parseInt(match[3], 10);
-    } else if (pattern.source.startsWith('(january')) {
-      month = monthMap[match[1].toLowerCase()];
-      day = parseInt(match[2], 10);
-      year = parseInt(match[3], 10);
-    } else {
-      year = parseInt(match[3], 10);
-      month = parseInt(match[1], 10) - 1;
-      day = parseInt(match[2], 10);
-    }
-
-    if (Number.isNaN(month) || Number.isNaN(day) || Number.isNaN(year)) {
-      continue;
-    }
-
-    const parsedDate = new Date(Date.UTC(year, month, day));
-    return formatDateYYYYMMDD(parsedDate);
+  for (const { re, parse } of partialPatterns) {
+    const m = question.match(re);
+    if (!m) continue;
+    const { month, day } = parse(m);
+    if ([month, day].some((v) => v === undefined || Number.isNaN(v))) continue;
+    // Return sentinel so the caller resolves the year asynchronously.
+    return { partialMonth: month, partialDay: day };
   }
 
   return null;
 }
 
+// Resolves a partial date (month + day, no year) to a full YYYYMMDD string
+// by querying the DB for the most recent year that actually has data for
+// that month/day combination. Falls back to the current year if nothing found.
+async function resolvePartialDate(partialMonth, partialDay) {
+  const monthStr = String(partialMonth + 1).padStart(2, '0');
+  const dayStr = String(partialDay).padStart(2, '0');
+  const pattern = `____${monthStr}${dayStr}`;
+  try {
+    const { rows } = await pool.query(
+      `SELECT MAX(posting_date_key::text) AS d FROM fact_quality_material_movement WHERE posting_date_key::text LIKE $1`,
+      [pattern]
+    );
+    if (rows[0]?.d) return String(rows[0].d);
+  } catch (_) { /* fall through */ }
+  // If nothing in DB, use current calendar year as best guess.
+  const year = new Date().getFullYear();
+  return `${year}${monthStr}${dayStr}`;
+}
+
 function extractMovementTypeFilter(question) {
   const lower = question.toLowerCase();
-  if (lower.includes('generation') || lower.includes('generated') || lower.includes('produced') || lower.includes('output')) {
-    return ['101', '102'];
-  }
-  if (lower.includes('consumption') || lower.includes('consumed') || lower.includes('used')) {
-    return ['261', '262'];
-  }
+  const wantGen = /generation|generated|produced|output/i.test(lower);
+  const wantCon = /consumption|consumed|used/i.test(lower);
+
+  const abstractNet = (!wantGen && !wantCon) && /efficient|efficiency|perform|performing|best|worst/i.test(lower);
+  const wantBoth = /compare|comparison|vs|versus|net|both/i.test(lower) || (wantGen && wantCon) || abstractNet;
+
+  if (wantBoth) return ['101', '102', '261', '262'];
+  if (wantGen) return ['101', '102'];
+  if (wantCon) return ['261', '262'];
   return [];
 }
 
+// Parses a month (+ optional year) mention. When the year is omitted,
+// returns year=null — callers should query all years matching that month
+// unless they can infer the year from context (e.g. the latest available).
 function parseMonthYear(question) {
   const lower = question.toLowerCase();
   const monthMap = {
@@ -236,18 +280,16 @@ function parseMonthYear(question) {
   if (!monthMatch) return null;
   const month = monthMap[monthMatch[1].toLowerCase()];
   const year = yearMatch ? parseInt(yearMatch[1], 10) : null;
-  return { month, year };
+  return { month, year, yearInferred: !yearMatch };
 }
 
 function findExplicitPlantMention(text, plantNames) {
   if (!text) return null;
   const lowerText = String(text).toLowerCase();
-  // Sort longest-first so a specific name (e.g. "ANGUL POWER Plant Unit5(135MW)")
-  // wins over a shorter generic name (e.g. "Power Plant").
-  // Minimum length of 14 skips ultra-generic names ("Plant", "Power Plant").
   const sorted = [...plantNames].filter(Boolean).sort((a, b) => b.length - a.length);
   for (const name of sorted) {
-    if (name.length < 14) continue;
+    const core = coreMatchTokens(name);
+    if (!core || core.length < 2) continue; // Skip generic names that have no unique tokens
     if (lowerText.includes(name.toLowerCase())) return name;
   }
   return null;
@@ -261,14 +303,21 @@ function updateSessionState(sessionId, message, plantNames, cities, historyItems
   if (!sessionId) return null;
 
   if (!activeSessions.has(sessionId)) {
-    activeSessions.set(sessionId, { currentPlant: null, currentCity: null, currentDate: null });
+    activeSessions.set(sessionId, {
+      currentPlant: null,
+      currentCity: null,
+      currentDate: null,
+      lastAggregateMetric: null, // 'generation' | 'consumption' | 'both'
+    });
   }
 
   const session = activeSessions.get(sessionId);
 
   let explicitPlant = findExplicitPlantMention(message, plantNames);
 
-  if (!explicitPlant && historyItems) {
+  const isFollowUp = referencesPreviousSubject(message);
+
+  if (!explicitPlant && historyItems && isFollowUp) {
     for (let i = historyItems.length - 1; i >= 0; i -= 1) {
       const text = historyItems[i]?.content || historyItems[i]?.text || '';
       explicitPlant = findExplicitPlantMention(text, plantNames);
@@ -279,10 +328,13 @@ function updateSessionState(sessionId, message, plantNames, cities, historyItems
   if (explicitPlant) {
     session.currentPlant = explicitPlant;
     session.currentCity = null;
+  } else if (!isFollowUp) {
+    // User didn't specify a plant and didn't use a pronoun, so clear context.
+    session.currentPlant = null;
   }
 
   let explicitCity = identityMatch(message, cities);
-  if (!explicitCity && historyItems) {
+  if (!explicitCity && historyItems && isFollowUp) {
     for (let i = historyItems.length - 1; i >= 0; i -= 1) {
       const text = historyItems[i]?.content || historyItems[i]?.text || '';
       explicitCity = identityMatch(text, cities);
@@ -293,11 +345,15 @@ function updateSessionState(sessionId, message, plantNames, cities, historyItems
   if (explicitCity && !explicitPlant) {
     session.currentCity = explicitCity;
     session.currentPlant = null;
+  } else if (!explicitCity && !explicitPlant && !isFollowUp) {
+    session.currentCity = null;
   }
 
   const explicitDate = extractRequestedDate(message);
   if (explicitDate) {
     session.currentDate = explicitDate;
+  } else if (!isFollowUp) {
+    session.currentDate = null;
   }
 
   return session;
@@ -365,17 +421,16 @@ function identityMatch(normalizedQuestion, candidates) {
   });
 }
 
-function isGeneralKnowledgeQuestion(question) {
-  const lower = String(question || '').toLowerCase();
-  return /\b(hi|hello|hey|greetings|good morning|good afternoon|good evening|how are you|who are you|what are you|tell me about yourself|your name|where are you from|what is ai|what is artificial intelligence|define ai|define artificial intelligence|what is machine learning|help me|thanks|thank you|bye|goodbye)\b/.test(lower);
+// Returns true for genuine small-talk / greetings that should NEVER touch the DB.
+function isGreeting(question) {
+  const lower = String(question || '').toLowerCase().trim();
+  return /^(hi|hello|hey|greetings|good morning|good afternoon|good evening|how are you|who are you|what are you|tell me about yourself|your name|where are you from|what is ai|what is artificial intelligence|define ai|define artificial intelligence|what is machine learning|help me|thanks|thank you|bye|goodbye)[.!?]?$/.test(lower);
 }
 
 function detectDashboardQuery(question) {
   const lower = String(question || '').toLowerCase();
-  if (isGeneralKnowledgeQuestion(question)) {
-    return false;
-  }
-  return /\b(plant|plants|generation|generated|production|produced|consumption|consumed|use|used|region|location|city|power|quantity|kwh|material|movement|movement type|date|month|year|trend|compare|comparison|volume|metric|capacity|forecast|load|top|highest|lowest|most|least|it|that|this)\b/.test(lower);
+  if (isGreeting(question)) return false;
+  return /\b(plant|plants|generation|generated|production|produced|consumption|consumed|use|used|region|location|city|power|quantity|kwh|material|movement|movement type|date|month|year|trend|compare|comparison|volume|metric|capacity|forecast|load|top|highest|lowest|most|least|best|worst|efficient|efficiency|perform|performing|it|that|this|dashboard|data|database|report|analysis|analytics|how much|what is the|tell me about|show me|give me|list|summary|net)\b/.test(lower);
 }
 
 function detectChartIntent(question) {
@@ -398,8 +453,9 @@ function getRequestedChartType(question) {
 
 function getSeriesTotals(rows) {
   return rows.reduce((acc, row) => {
-    if (['101', '102'].includes(row.movementType)) acc.generation += row.quantity;
-    if (['261', '262'].includes(row.movementType)) acc.consumption += row.quantity;
+    const signedQuantity = getSignedQuantity(row);
+    if (['101', '102'].includes(row.movementType)) acc.generation += signedQuantity;
+    if (['261', '262'].includes(row.movementType)) acc.consumption += signedQuantity;
     return acc;
   }, { generation: 0, consumption: 0 });
 }
@@ -407,9 +463,10 @@ function getSeriesTotals(rows) {
 function groupTotalsByDate(rows) {
   const grouped = rows.reduce((acc, row) => {
     if (!acc[row.date]) acc[row.date] = { generation: 0, consumption: 0, total: 0 };
-    if (['101', '102'].includes(row.movementType)) acc[row.date].generation += row.quantity;
-    if (['261', '262'].includes(row.movementType)) acc[row.date].consumption += row.quantity;
-    acc[row.date].total += row.quantity;
+    const signedQuantity = getSignedQuantity(row);
+    if (['101', '102'].includes(row.movementType)) acc[row.date].generation += signedQuantity;
+    if (['261', '262'].includes(row.movementType)) acc[row.date].consumption += signedQuantity;
+    acc[row.date].total += signedQuantity;
     return acc;
   }, {});
   const sortedDates = Object.keys(grouped).sort();
@@ -422,9 +479,189 @@ function getTopGroupedTotals(rows, groupKey = 'plant', limit = 10) {
     const key = groupKey === 'city'
       ? (row.city || 'Unknown')
       : (row.plantName || row.city || row.senderPlantKey || 'Unknown');
-    grouped[key] = (grouped[key] || 0) + row.quantity;
+    grouped[key] = (grouped[key] || 0) + getSignedQuantity(row);
   });
   return Object.entries(grouped).sort((a, b) => b[1] - a[1]).slice(0, limit);
+}
+
+// Movement-type sign convention used across every dashboard calculation:
+//   - codes ending in "1" (101, 261, ...) ADD to their respective total
+//   - codes ending in "2" (102, 262, ...) SUBTRACT from their respective total
+function getMovementSign(movementType) {
+  const code = String(movementType || '');
+  if (code.endsWith('1')) return 1;
+  if (code.endsWith('2')) return -1;
+  return 0;
+}
+
+function getSignedQuantity(row) {
+  return getMovementSign(row.movementType) * (Number(row.quantity) || 0);
+}
+
+// Words to ignore when comparing a user's question against DB plant names —
+// applied to BOTH sides so only the distinguishing tokens (capacity figures,
+// unit identifiers like "SBPP-2") are compared. Without this, a question
+// like "total generation of 2 X 525 MW Power Plant" fails to match because
+// the raw question text (with "total generation of" etc.) is never a
+// substring of the DB name and vice versa.
+const PLANT_MATCH_STOPWORDS = new Set([
+  'total', 'sum', 'overall', 'cumulative', 'aggregate', 'net',
+  'generation', 'generated', 'production', 'produced',
+  'consumption', 'consumed', 'quantity', 'volume', 'output', 'kwh',
+  'of', 'for', 'the', 'a', 'an', 'is', 'was', 'were', 'what',
+  'show', 'give', 'tell', 'me', 'please', 'and', 'in', 'on', 'at', 'to',
+  'plant', 'plants', 'power', 'mw',
+]);
+
+function coreMatchTokens(text) {
+  return normalizeText(text)
+    .split(' ')
+    .filter((token) => token && !PLANT_MATCH_STOPWORDS.has(token))
+    .join(' ');
+}
+
+function findMatchingPlantNames(text, plantNames, { minLength = 3, maxMatches = 8 } = {}) {
+  const queryCore = coreMatchTokens(text);
+  if (!queryCore || queryCore.length < minLength) return [];
+
+  return plantNames.filter(Boolean).filter((name) => {
+    const nameCore = coreMatchTokens(name);
+    if (!nameCore) return false;
+    // Bidirectional: covers both "user typed the full specific unit name"
+    // (queryCore contains nameCore) and "user typed a generic capacity
+    // label that matches one or more specific units" (nameCore contains
+    // queryCore, e.g. "2 X 525 MW Power Plant" matching both SBPP-1 and
+    // SBPP-2 units that share that rated capacity).
+    return queryCore.includes(nameCore) || nameCore.includes(queryCore);
+  }).slice(0, maxMatches + 1); // +1 lets the caller detect "too many matches"
+}
+
+function detectAggregateQuery(question) {
+  const lower = String(question || '').toLowerCase();
+  const hasAggregateWord = /\b(total|sum|overall|cumulative|aggregate|grand total|net)\b/.test(lower);
+  const hasMetricWord = /\b(generation|generated|production|produced|consumption|consumed|quantity|volume|output|kwh)\b/.test(lower);
+  const isRanking = /highest|maximum|largest|top|most|peak|lowest|minimum|smallest|least|best|worst/i.test(lower);
+  return hasAggregateWord && hasMetricWord && !isRanking;
+}
+
+// A global ranking query is one that asks to rank/compare plants or regions
+// without specifying a particular plant. These must always search all records.
+function detectRankingQuery(question) {
+  const lower = String(question || '').toLowerCase();
+  const hasRankingWord = /\b(highest|maximum|largest|top|most|peak|lowest|minimum|smallest|least|best|worst|rank|ranking|ranked)\b/i.test(lower);
+  const hasEntityWord = /\b(plant|plants|region|regions|city|cities|location|locations|facility|facilities|who|which)\b/i.test(lower);
+  const hasMetric = /\b(generation|generated|production|produced|consumption|consumed|power|quantity|volume|output|kwh|net|perform|efficient)\b/i.test(lower);
+  const hasExplicitRankCount = /\btop\s+\d+\b/i.test(lower);
+  return hasRankingWord && (hasEntityWord || hasExplicitRankCount) && hasMetric;
+}
+
+// Computes a total/sum answer directly from PostgreSQL — no LLM arithmetic
+// involved. LLMs are unreliable at summing many large numbers, and the
+// chatbot's general dashboard-query path only samples a handful of rows,
+// so "total generation of X" questions must never be answered by asking
+// Ollama to add numbers itself.
+async function buildAggregateAnswer(question, resolvedPlant, resolvedCity, matchedPlantNames, session) {
+  const lower = question.toLowerCase();
+  // Resolve partial dates (e.g. "17th June" with no year) via DB lookup.
+  const rawDate = extractRequestedDate(question);
+  let exactDate = null;
+  if (rawDate && typeof rawDate === 'string') {
+    exactDate = rawDate;
+  } else if (rawDate && typeof rawDate === 'object' && rawDate.partialMonth !== undefined) {
+    exactDate = await resolvePartialDate(rawDate.partialMonth, rawDate.partialDay);
+  }
+  const monthYear = parseMonthYear(question);
+
+  let query = `
+    SELECT
+      f.posting_date_key::text as date,
+      f.movement_type::text as "movementType",
+      f.quantity,
+      p.name1 as "plantName",
+      p.ort01 as city
+    FROM fact_quality_material_movement f
+    LEFT JOIN plant_master p ON f.sender_plant_key = p.werks
+    WHERE 1=1
+  `;
+  const values = [];
+  let paramCount = 1;
+
+  if (matchedPlantNames && matchedPlantNames.length > 1) {
+    query += ` AND p.name1 = ANY($${paramCount++})`;
+    values.push(matchedPlantNames);
+  } else if (resolvedPlant) {
+    query += ` AND p.name1 = $${paramCount++}`;
+    values.push(resolvedPlant);
+  } else if (resolvedCity) {
+    query += ` AND p.ort01 ILIKE $${paramCount++}`;
+    values.push(`%${resolvedCity}%`);
+  }
+
+  if (exactDate) {
+    query += ` AND f.posting_date_key::text = $${paramCount++}`;
+    values.push(exactDate);
+  }
+
+  if (monthYear) {
+    const yearStr = monthYear.year !== null ? String(monthYear.year) : '__';
+    const monthStr = String(monthYear.month + 1).padStart(2, '0');
+    const likePattern = monthYear.year !== null ? `${yearStr}${monthStr}%` : `____${monthStr}%`;
+    query += ` AND f.posting_date_key::text LIKE $${paramCount++}`;
+    values.push(likePattern);
+  }
+
+  const wantGenExplicit = /generation|generated|produced|output/i.test(lower);
+  const wantConExplicit = /consumption|consumed|used/i.test(lower);
+  const abstractNet = (!wantGenExplicit && !wantConExplicit) && /efficient|efficiency|perform|performing|best|worst/i.test(lower);
+  const wantBothExplicit = /compare|comparison|vs|versus|net|both/i.test(lower) || (wantGenExplicit && wantConExplicit) || abstractNet;
+
+  let wantGen = wantGenExplicit;
+  let wantCon = wantConExplicit;
+  let wantBoth = wantBothExplicit;
+
+  // Follow-up message me metric word missing hai (e.g. "and of this Plant X?")
+  // — pichli turn ka metric session se reuse karo
+  if (!wantGenExplicit && !wantConExplicit && session?.lastAggregateMetric) {
+    wantGen = session.lastAggregateMetric === 'generation';
+    wantCon = session.lastAggregateMetric === 'consumption';
+    wantBoth = session.lastAggregateMetric === 'both';
+  }
+
+  if (wantBoth) {
+    query += ` AND f.movement_type::text IN ('101', '102', '261', '262')`;
+  } else if (wantCon && !wantGen) {
+    query += ` AND f.movement_type::text IN ('261', '262')`;
+  } else {
+    // Default to generation when metric isn't explicit or resolvable
+    query += ` AND f.movement_type::text IN ('101', '102')`;
+  }
+
+  const { rows } = await pool.query(query, values);
+  const filtered = rows.map(rowToDashboardRecord);
+
+  if (!filtered.length) {
+    return null;
+  }
+
+  const totals = getSeriesTotals(filtered);
+  const subjectLabel = (matchedPlantNames && matchedPlantNames.length > 1)
+    ? `the ${matchedPlantNames.length} matching plants (${matchedPlantNames.join(', ')})`
+    : (resolvedPlant || resolvedCity || 'all plants');
+
+  const formatNumber = (value) => Math.round(value).toLocaleString();
+
+  // Is turn ka resolved metric agli follow-up ke liye session me save karo
+  if (session) {
+    session.lastAggregateMetric = wantBoth ? 'both' : (wantCon && !wantGen ? 'consumption' : 'generation');
+  }
+
+  if (wantBoth) {
+    return `For ${subjectLabel}, total generation is ${formatNumber(totals.generation)} kWh, total consumption is ${formatNumber(totals.consumption)} kWh, and the net difference is ${formatNumber(totals.generation - totals.consumption)} kWh.`;
+  }
+  if (wantCon && !wantGen) {
+    return `The total consumption for ${subjectLabel} is ${formatNumber(totals.consumption)} kWh.`;
+  }
+  return `The total generation for ${subjectLabel} is ${formatNumber(totals.generation)} kWh.`;
 }
 
 function shortenLabel(value, max = 18) {
@@ -434,7 +671,14 @@ function shortenLabel(value, max = 18) {
 
 async function buildChartResponse(question, resolvedPlant, resolvedCity) {
   const lower = question.toLowerCase();
-  const exactDate = extractRequestedDate(question);
+  // Resolve partial dates (e.g. "17th June" with no year) via DB lookup.
+  const rawDate = extractRequestedDate(question);
+  let exactDate = null;
+  if (rawDate && typeof rawDate === 'string') {
+    exactDate = rawDate;
+  } else if (rawDate && typeof rawDate === 'object' && rawDate.partialMonth !== undefined) {
+    exactDate = await resolvePartialDate(rawDate.partialMonth, rawDate.partialDay);
+  }
   const monthYear = parseMonthYear(question);
   const requestedChartType = getRequestedChartType(question);
 
@@ -476,21 +720,23 @@ async function buildChartResponse(question, resolvedPlant, resolvedCity) {
 
   const wantGen = /generation|generated|produced|output/i.test(lower);
   const wantCon = /consumption|consumed|used/i.test(lower);
-  const wantBoth = /compare|comparison|vs|versus/i.test(lower) || /generation.*consumption|consumption.*generation/i.test(lower);
+  const abstractNet = (!wantGen && !wantCon) && /efficient|efficiency|perform|performing|best|worst/i.test(lower);
+  const wantBoth = /compare|comparison|vs|versus|net|both/i.test(lower) || (wantGen && wantCon) || abstractNet;
 
   // Gauge charts always need BOTH categories pulled from the DB so the max
   // can be sized against real generation/consumption totals. Without this,
   // a single-category query (e.g. "consumption gauge") only ever fetches
   // consumption rows, generation comes back as 0, and the gauge's max ends
   // up equal to its own value — pegging the needle at 100% every time.
-  if (requestedChartType === 'gauge') {
+  if (requestedChartType === 'gauge' || wantBoth) {
     query += ` AND f.movement_type::text IN ('101', '102', '261', '262')`;
-  } else if (wantBoth) {
-    query += ` AND f.movement_type::text IN ('101', '102', '261', '262')`;
-  } else if (wantGen && !wantCon) {
+  } else if (wantGen) {
     query += ` AND f.movement_type::text IN ('101', '102')`;
-  } else if (wantCon && !wantGen) {
+  } else if (wantCon) {
     query += ` AND f.movement_type::text IN ('261', '262')`;
+  } else {
+    // Default to generation when metric isn't explicit or resolvable
+    query += ` AND f.movement_type::text IN ('101', '102')`;
   }
 
   const { rows } = await pool.query(query, values);
@@ -573,9 +819,9 @@ async function buildChartResponse(question, resolvedPlant, resolvedCity) {
     // populated since the query above always includes both categories for
     // gauge charts), with 15% headroom so the arc/needle has visual room to
     // move instead of always reading pegged at 100%.
-    const referenceMax = Math.max(totals.generation, totals.consumption, Math.abs(value), 1);
+    const referenceMax = Math.max(Math.abs(totals.generation), Math.abs(totals.consumption), Math.abs(value), 1);
     const max = referenceMax * 1.15;
-    
+
 
     chart.chartType = 'gauge';
     chart.title = `Gauge${subjectLabel ? ` for ${subjectLabel}` : ''}`;
@@ -589,7 +835,7 @@ async function buildChartResponse(question, resolvedPlant, resolvedCity) {
     chart.table = { headers: ['Metric', 'Value'], rows: [['Generation', totals.generation], ['Consumption', totals.consumption], ['Net', totals.generation - totals.consumption]] };
     return chart;
   }
-  
+
 
   if (requestedChartType === 'histogram') {
     const quantities = filtered.map((row) => row.quantity).filter((value) => Number.isFinite(value));
@@ -625,11 +871,13 @@ async function buildChartResponse(question, resolvedPlant, resolvedCity) {
     filtered.forEach((row) => {
       if (Object.prototype.hasOwnProperty.call(movementTotals, row.movementType)) movementTotals[row.movementType] += row.quantity;
     });
+    // 101/261 add to their respective total, 102/262 subtract — the bridge
+    // steps below are signed accordingly so they sum to the correct Net.
     const steps = [
       ['101 Generation', movementTotals['101']],
-      ['102 Generation', movementTotals['102']],
+      ['102 Generation (Reversal)', -movementTotals['102']],
       ['261 Consumption', -movementTotals['261']],
-      ['262 Consumption', -movementTotals['262']],
+      ['262 Consumption (Reversal)', movementTotals['262']],
     ];
     chart.chartType = 'waterfall';
     chart.title = `Waterfall Bridge${subjectLabel ? ` for ${subjectLabel}` : ''}`;
@@ -667,8 +915,9 @@ async function buildChartResponse(question, resolvedPlant, resolvedCity) {
     if (subjectLabel) {
       const totals = { generation: 0, consumption: 0 };
       filtered.forEach((row) => {
-        if (['101', '102'].includes(row.movementType)) totals.generation += row.quantity;
-        if (['261', '262'].includes(row.movementType)) totals.consumption += row.quantity;
+        const signedQuantity = getSignedQuantity(row);
+        if (['101', '102'].includes(row.movementType)) totals.generation += signedQuantity;
+        if (['261', '262'].includes(row.movementType)) totals.consumption += signedQuantity;
       });
       chart.chartType = 'bar';
       chart.title = `Generation vs Consumption for ${subjectLabel}`;
@@ -725,6 +974,14 @@ async function buildChartResponse(question, resolvedPlant, resolvedCity) {
   return chart;
 }
 
+const NAME_REGEX = /(?:my name is|i am|i'm|call me)\s+([A-Za-z][A-Za-z'-]{1,15}(?:\s+[A-Za-z][A-Za-z'-]{1,15})?)(?:\b|$|[.!?])/i;
+const INVALID_NAME_WORDS = ['asking', 'looking', 'wondering', 'trying', 'going', 'wanting', 'a', 'the', 'some', 'any', 'which', 'what', 'how', 'why', 'who', 'where', 'when', 'to', 'for', 'in', 'on', 'at', 'by', 'with', 'from', 'about', 'as', 'into', 'like', 'through', 'after', 'over', 'between', 'out', 'against', 'during', 'without', 'before', 'under', 'around', 'among'];
+
+function isValidName(name) {
+  const lowerName = name.toLowerCase();
+  return !INVALID_NAME_WORDS.some(w => lowerName.startsWith(w + ' ') || lowerName === w);
+}
+
 function extractMemoryNotes(historyItems = []) {
   const notes = [];
   const seen = new Set();
@@ -732,13 +989,15 @@ function extractMemoryNotes(historyItems = []) {
     .filter((item) => item && typeof item.content === 'string' && item.content.trim())
     .forEach((item) => {
       const content = item.content.trim();
-      const nameMatch = content.match(/(?:my name is|i am|i'm|call me)\s+([a-z][a-z' -]{1,30})/i);
+      const nameMatch = content.match(NAME_REGEX);
       if (nameMatch) {
         const name = nameMatch[1].trim();
-        const key = `name:${name.toLowerCase()}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          notes.push(`The user's name is ${name}.`);
+        if (isValidName(name)) {
+          const key = `name:${name.toLowerCase()}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            notes.push(`The user's name is ${name}.`);
+          }
         }
       }
     });
@@ -746,8 +1005,10 @@ function extractMemoryNotes(historyItems = []) {
 }
 
 function extractNameFromText(text = '') {
-  const match = String(text || '').match(/(?:my name is|i am|i'm|call me)\s+([a-z][a-z' -]{1,30})/i);
-  return match ? match[1].trim() : null;
+  const match = String(text || '').match(NAME_REGEX);
+  if (!match) return null;
+  const name = match[1].trim();
+  return isValidName(name) ? name : null;
 }
 
 function extractStoredName(historyItems = []) {
@@ -772,15 +1033,89 @@ function getDirectMemoryReply(message, historyItems = []) {
   return null;
 }
 
-async function getRelevantRows(question) {
+// Returns a small set of representative rows for Ollama context.
+// For "highest / lowest" questions, aggregates by plant first so
+// rankings are consistent and never based on a single raw transaction row.
+async function getRelevantRows(question, resolvedPlant, resolvedCity) {
   const normalizedQuestion = question.toLowerCase();
-  const requestedDate = extractRequestedDate(question);
   const movementTypes = extractMovementTypeFilter(question);
-  const stopWords = new Set(['which', 'what', 'plant', 'plants', 'generated', 'generation', 'power', 'highest', 'lowest', 'top', 'most', 'least', 'on', 'the', 'for', 'at', 'with', 'and', 'was', 'were', 'did', 'from', 'to', 'of', 'a', 'an', 'or', 'in', 'is', 'are', 'show', 'give', 'tell', 'me', 'data', 'rows', 'row', 'trend']);
-  const keywordTerms = normalizedQuestion
-    .split(/[^a-z0-9]+/)
-    .filter((word) => word.length > 2 && !stopWords.has(word));
 
+  // Resolve the date (including year-inferred partial dates)
+  let rawDate = extractRequestedDate(question);
+  let requestedDate = null;
+  if (rawDate && typeof rawDate === 'string') {
+    requestedDate = rawDate;
+  } else if (rawDate && typeof rawDate === 'object' && rawDate.partialMonth !== undefined) {
+    requestedDate = await resolvePartialDate(rawDate.partialMonth, rawDate.partialDay);
+  }
+
+  const isRankingQuery = /highest|maximum|largest|top|most|peak|lowest|minimum|smallest|least|best|worst/i.test(normalizedQuestion);
+
+  // For ranking queries, aggregate totals by plant and sort — this guarantees
+  // consistent rankings (the same query always returns the same plant on top)
+  // because it sums ALL matching rows per plant, not just a single raw row.
+  if (isRankingQuery) {
+    const isAscending = /lowest|minimum|smallest|least|worst/i.test(normalizedQuestion);
+    let aggQuery = `
+      SELECT
+        p.name1 AS "plantName",
+        p.ort01 AS city,
+        SUM(CASE WHEN f.movement_type::text = '101' THEN f.quantity
+                 WHEN f.movement_type::text = '102' THEN -f.quantity ELSE 0 END) AS generation,
+        SUM(CASE WHEN f.movement_type::text = '261' THEN f.quantity
+                 WHEN f.movement_type::text = '262' THEN -f.quantity ELSE 0 END) AS consumption
+      FROM fact_quality_material_movement f
+      LEFT JOIN plant_master p ON f.sender_plant_key = p.werks
+      WHERE f.movement_type::text IN ('101', '102', '261', '262')
+    `;
+    const aggValues = [];
+    let aggParam = 1;
+
+    if (requestedDate) {
+      aggQuery += ` AND f.posting_date_key::text = $${aggParam++}`;
+      aggValues.push(requestedDate);
+    }
+    if (movementTypes.length > 0) {
+      aggQuery += ` AND f.movement_type::text = ANY($${aggParam++})`;
+      aggValues.push(movementTypes);
+    }
+    if (resolvedPlant) {
+      aggQuery += ` AND p.name1 = $${aggParam++}`;
+      aggValues.push(resolvedPlant);
+    } else if (resolvedCity) {
+      aggQuery += ` AND p.ort01 ILIKE $${aggParam++}`;
+      aggValues.push(`%${resolvedCity}%`);
+    }
+
+    const wantGen = /generation|generated|produced|output/i.test(normalizedQuestion);
+    const wantCon = /consumption|consumed|used/i.test(normalizedQuestion);
+    const abstractNet = (!wantGen && !wantCon) && /efficient|efficiency|perform|performing|best|worst/i.test(normalizedQuestion);
+    const wantBoth = /compare|comparison|vs|versus|net|both/i.test(normalizedQuestion) || (wantGen && wantCon) || abstractNet;
+
+    let sortCol = '3'; // Default to generation (3rd column)
+    if (wantBoth) {
+      sortCol = '(3 - 4)'; // generation - consumption
+    } else if (wantCon) {
+      sortCol = '4';       // consumption
+    }
+
+    aggQuery += ` GROUP BY p.name1, p.ort01 HAVING (SUM(f.quantity) > 0) ORDER BY ${sortCol} ${isAscending ? 'ASC' : 'DESC'} LIMIT 8`;
+
+    const { rows } = await pool.query(aggQuery, aggValues);
+    // Shape results so downstream Ollama prompt can read them naturally.
+    return rows.map((r, i) => ({
+      date: requestedDate || 'all dates',
+      movementType: wantBoth ? 'net' : (wantCon ? '261' : '101'),
+      quantity: wantBoth ? (parseFloat(r.generation || 0) - parseFloat(r.consumption || 0)) : (wantCon ? parseFloat(r.consumption || 0) : parseFloat(r.generation || 0)),
+      plantName: r.plantName || 'unknown',
+      city: r.city || 'unknown',
+      material: '',
+      senderPlantKey: '',
+      rank: i + 1,
+    }));
+  }
+
+  // Non-ranking query — fetch recent representative rows.
   let query = `
     SELECT 
       f.posting_date_key::text as date, 
@@ -792,7 +1127,7 @@ async function getRelevantRows(question) {
       f.sender_plant_key as "senderPlantKey"
     FROM fact_quality_material_movement f
     LEFT JOIN plant_master p ON f.sender_plant_key = p.werks
-    WHERE 1=1
+    WHERE f.movement_type::text IN ('101', '102', '261', '262')
   `;
   const values = [];
   let paramCount = 1;
@@ -807,37 +1142,15 @@ async function getRelevantRows(question) {
     values.push(movementTypes);
   }
 
-  // Only apply keyword ILIKE filter when we have no date/movementType filters.
-  // If a date or movement type is already specified, keyword matching can
-  // accidentally produce zero results (e.g. "generated" is a keyword term that
-  // doesn't exist in any text column, yet movement_type is already filtered).
-  if (keywordTerms.length > 0 && !requestedDate && movementTypes.length === 0) {
-    const conditions = [];
-    for (const term of keywordTerms) {
-      conditions.push(`
-        (p.name1 ILIKE $${paramCount} OR 
-         p.ort01 ILIKE $${paramCount} OR 
-         f.material_key ILIKE $${paramCount} OR 
-         f.sender_plant_key ILIKE $${paramCount})
-      `);
-      values.push(`%${term}%`);
-      paramCount++;
-    }
-    query += ` AND (${conditions.join(' OR ')})`;
+  if (resolvedPlant) {
+    query += ` AND p.name1 = $${paramCount++}`;
+    values.push(resolvedPlant);
+  } else if (resolvedCity) {
+    query += ` AND p.ort01 ILIKE $${paramCount++}`;
+    values.push(`%${resolvedCity}%`);
   }
 
-  const isAscending = /lowest|minimum|smallest|least/i.test(normalizedQuestion);
-  const isDescending = /highest|maximum|largest|top|most|peak/i.test(normalizedQuestion);
-
-  if (isAscending) {
-    query += ` ORDER BY f.quantity ASC`;
-  } else if (isDescending) {
-    query += ` ORDER BY f.quantity DESC`;
-  } else {
-    query += ` ORDER BY f.posting_date_key DESC, f.quantity DESC`;
-  }
-
-  query += ` LIMIT 8`;
+  query += ` ORDER BY f.posting_date_key DESC, f.quantity DESC LIMIT 8`;
 
   const { rows } = await pool.query(query, values);
   return rows.map(rowToDashboardRecord);
@@ -922,8 +1235,16 @@ app.get('/api/trend', async (req, res) => {
     let query = `
       SELECT
         f.posting_date_key::text as date,
-        SUM(CASE WHEN f.movement_type::text IN ('101', '102') THEN f.quantity ELSE 0 END) as generation,
-        SUM(CASE WHEN f.movement_type::text IN ('261', '262') THEN f.quantity ELSE 0 END) as consumption
+        SUM(CASE
+          WHEN f.movement_type::text = '101' THEN f.quantity
+          WHEN f.movement_type::text = '102' THEN -f.quantity
+          ELSE 0
+        END) as generation,
+        SUM(CASE
+          WHEN f.movement_type::text = '261' THEN f.quantity
+          WHEN f.movement_type::text = '262' THEN -f.quantity
+          ELSE 0
+        END) as consumption
       FROM fact_quality_material_movement f
       LEFT JOIN plant_master p ON f.sender_plant_key = p.werks
       WHERE f.movement_type::text IN ('101', '102', '261', '262')
@@ -959,11 +1280,11 @@ app.get('/api/trend', async (req, res) => {
   }
 });
 
+
 app.post('/api/chat', authenticateToken, async (req, res) => {
   try {
     const message = req.body?.message ?? req.body?.question ?? '';
     const history = Array.isArray(req.body?.history) ? req.body.history : [];
-    const rawMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const sessionId = req.body?.sessionId;
 
     if (typeof message !== 'string' || !message.trim()) {
@@ -974,38 +1295,24 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
 
     const generateTitleAsync = async (sessionId, userMessage) => {
       try {
-        if (/^(hi|hello|hey|thanks|can you help me\??)$/i.test(userMessage.trim())) {
-          return; // Ignore generic greetings
-        }
-        
-        // Ensure message is somewhat meaningful
+        if (/^(hi|hello|hey|thanks|can you help me\??)$/i.test(userMessage.trim())) return;
         if (userMessage.length < 5) return;
-
-        console.log(`🧠 Generating chat title for session: ${sessionId}`);
-        const response = await fetch('http://localhost:11434/api/chat', {
+        const response = await fetch(`${OLLAMA_URL}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: 'llama3.2',
-            messages: [{
-              role: 'user', 
-              content: `Generate a concise, 3 to 6 word title summarizing this message. Use sentence case. Do not use quotes or trailing punctuation. Respond ONLY with the title. Message: "${userMessage}"`
-            }],
+            messages: [{ role: 'user', content: `Generate a concise, 3 to 6 word title summarizing this message. Use sentence case. Do not use quotes or trailing punctuation. Respond ONLY with the title. Message: "${userMessage}"` }],
             stream: false,
           }),
         });
-
         if (response.ok) {
           const data = await response.json();
           let title = data?.message?.content?.trim();
           if (title) {
-            // Remove any surrounding quotes just in case
             title = title.replace(/^["']|["']$/g, '');
-            // Sentence case
             title = title.charAt(0).toUpperCase() + title.slice(1);
-            
             await pool.query('UPDATE chat_sessions SET title = $1 WHERE id = $2', [title, sessionId]);
-            console.log(`✅ Title updated to: "${title}"`);
           }
         }
       } catch (e) {
@@ -1016,199 +1323,133 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
     const saveMessage = async (role, content) => {
       try {
         if (sessionId && req.user && req.user.userId) {
-          // Verify session belongs to user
           const sessionCheck = await pool.query('SELECT id, title FROM chat_sessions WHERE id = $1 AND user_id = $2', [sessionId, req.user.userId]);
           if (sessionCheck.rows.length > 0) {
             const contentStr = typeof content === 'string' ? content : JSON.stringify(content);
             await pool.query('INSERT INTO chat_messages (session_id, role, content, created_at) VALUES ($1, $2, $3, NOW())', [sessionId, role, contentStr]);
             await pool.query('UPDATE chat_sessions SET updated_at = NOW() WHERE id = $1', [sessionId]);
-            
-            // If it's a user message and the session title is still the default "New Chat"
             if (role === 'user' && sessionCheck.rows[0].title === 'New Chat') {
               generateTitleAsync(sessionId, typeof content === 'string' ? content : (content.text || ''));
             }
           }
         }
-      } catch (e) {
-        console.error('Error saving chat message to DB', e);
-      }
+      } catch (e) { }
     };
 
-    // Save the user's incoming message asynchronously
     saveMessage('user', message);
 
-    // Intercept response to save the assistant's reply
     const originalJson = res.json;
     res.json = function (body) {
-      if (res.statusCode === 200 && !body.error) {
-        saveMessage('assistant', body);
-      }
+      if (res.statusCode === 200 && !body.error) saveMessage('assistant', body);
       return originalJson.call(this, body);
     };
 
     const originalSend = res.send;
     res.send = function (body) {
-      if (res.statusCode === 200 && res.get('Content-Type')?.includes('text/plain')) {
-        saveMessage('assistant', body);
-      }
+      if (res.statusCode === 200 && res.get('Content-Type')?.includes('text/plain')) saveMessage('assistant', body);
       return originalSend.call(this, body);
     };
 
-    const normalizeHistoryItems = (historyItems = []) => {
-      return (historyItems || [])
-        .filter((item) => item && typeof item === 'object')
-        .map((item) => {
-          if (item.role && ['system', 'user', 'assistant'].includes(item.role)) {
-            return { role: item.role, content: String(item.content || '').trim() };
-          }
-          if (item.sender === 'user') {
-            return { role: 'user', content: String(item.text || item.content || '').trim() };
-          }
-          if (item.sender === 'bot' || item.role === 'assistant') {
-            return { role: 'assistant', content: String(item.text || item.content || '').trim() };
-          }
-          return null;
-        })
-        .filter((item) => item && item.content);
-    };
+    const orchestratorPrompt = `You are an orchestrator for the Power Plant Dashboard AI.
+Analyze the user's message and determine the intent. Return ONLY a valid JSON object.
+Schema:
+Table fact_quality_material_movement (f)
+  posting_date_key (text YYYYMMDD)
+  movement_type (text '101'/'102'=generation, '261'/'262'=consumption)
+  quantity (numeric)
+  sender_plant_key (text)
+Table plant_master (p)
+  werks (text, matches sender_plant_key)
+  name1 (text, Plant Name)
+  ort01 (text, City)
 
-    const isDashboardQuery = detectDashboardQuery(message);
-    const wantsChart = detectChartIntent(message);
+Intents:
+1. "dashboard_component": User wants to see a chart, graph, table, or dashboard view.
+   Valid components: "kpi", "table", "trend", "top_plants", "regional", "movement", "all".
+2. "data_question": User asks a specific data question requiring querying the DB (e.g. "What was the total generation for SBPP-1?").
+3. "general": Greetings, small talk, or non-data questions.
 
-    if (wantsChart) {
-      const normalizedHistory = normalizeHistoryItems(rawMessages.length ? rawMessages : history);
+Output JSON format:
+{
+  "intent": "dashboard_component" | "data_question" | "general",
+  "components": ["..."], // if dashboard_component, array of components, else null
+  "filters": {
+    "plant": "All" | "<Plant Name>",
+    "city": "All" | "<City Name>",
+    "dateRange": "All" | "7D" | "30D" | "Month" | "Year"
+  },
+  "sql": "..." // if data_question, provide a valid PostgreSQL query. limit results to 20. use SUM() and GROUP BY if aggregating. 
+}
 
-      const session = updateSessionState(sessionId, message, cachedPlantNames, cachedCities, normalizedHistory);
-      const { plant: resolvedPlant, city: resolvedCity, source } = resolveContextFromSession(message, session);
+User Message: "${message}"
+JSON:`;
 
-      const pronounRef = referencesPreviousSubject(message);
-      const explicitInMessage = findExplicitPlantMention(message, cachedPlantNames);
+    const response = await fetch(`${OLLAMA_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: orchestratorPrompt }],
+        stream: false,
+        options: { temperature: 0.1 },
+        format: 'json'
+      }),
+    });
 
-      console.log(`[chart] message="${message}" sessionId="${sessionId}"`);
-      console.log(`[chart] resolvedPlant=${resolvedPlant || 'none'} resolvedCity=${resolvedCity || 'none'} source=${source} pronounRef=${pronounRef}`);
+    if (!response.ok) throw new Error('Ollama unavailable');
+    const data = await response.json();
+    const resultText = data.message.content.trim();
+    const result = JSON.parse(resultText);
 
-      if (pronounRef && !resolvedPlant && !resolvedCity) {
-        return res.json({
-          type: 'text',
-          message: 'Could you please specify which plant or region you are referring to?',
+    if (result.intent === 'dashboard_component') {
+      return res.json({
+        type: 'dashboard_component',
+        components: result.components || ['all'],
+        filters: result.filters || { plant: 'All', city: 'All', dateRange: 'All' }
+      });
+    } else if (result.intent === 'data_question' && result.sql) {
+      try {
+        const { rows } = await pool.query(result.sql);
+        const dataContext = JSON.stringify(rows);
+
+        const finalPrompt = `You are SteelAI, a data assistant.
+The user asked: "${message}"
+Database results: ${dataContext}
+Answer the user's question clearly and concisely using only the database results provided. Do not invent any numbers. Do not output SQL.`;
+
+        const finalResponse = await fetch(`${OLLAMA_URL}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'llama3.2',
+            messages: [{ role: 'user', content: finalPrompt }],
+            stream: false,
+            options: { temperature: 0.1 }
+          }),
         });
+        const finalData = await finalResponse.json();
+        return res.type('text/plain').send(finalData.message.content.trim());
+      } catch (err) {
+        console.error('SQL Error:', err);
+        return res.type('text/plain').send('Sorry, I encountered an error running the database query.');
       }
-
-      const mentionsUnknownPlant = !explicitInMessage
-        && !pronounRef
-        && !resolvedPlant
-        && /\b(for|about|named|called)\s+(the\s+)?plant\b|\bplant\s+["']?[a-z0-9]/i.test(message)
-        && !/\b(by|per|top|all)\s+plants?\b/i.test(message);
-      if (mentionsUnknownPlant) {
-        const suggestions = findClosestPlants(message, cachedPlantNames, 3);
-        console.log(`[chart] Plant not found. Suggestions: ${suggestions.join(', ')}`);
-        return res.json({
-          type: 'text',
-          message: `Plant not found. Did you mean: ${suggestions.join(', ')}?`,
-        });
-      }
-
-      const chartResponse = await buildChartResponse(message, resolvedPlant, resolvedCity);
-      if (chartResponse) {
-        console.log(`✅ Chart generated for plant="${chartResponse.plant || 'ALL PLANTS'}" city="${resolvedCity || 'ALL CITIES'}"`);
-        return res.json(chartResponse);
-      }
-
-      if (resolvedPlant || resolvedCity) {
-        const entity = resolvedPlant || resolvedCity;
-        console.log(`⚠️ No chart data available for resolved entity="${entity}"`);
-        return res.json({
-          type: 'text',
-          message: `No chart data available for ${entity} with the current filters.`,
-        });
-      }
-    }
-
-    const buildConversationMessages = (historyItems = [], currentMessage, systemPrompt = '') => {
-      const normalizedHistory = normalizeHistoryItems(historyItems).slice(-18);
-      const memoryNotes = extractMemoryNotes(normalizedHistory);
-      const effectiveSystemPrompt = [systemPrompt, memoryNotes.length ? `Memory notes:\n- ${memoryNotes.join('\n- ')}` : ''].filter(Boolean).join('\n\n');
-      const messages = [];
-      if (effectiveSystemPrompt) {
-        messages.push({ role: 'system', content: effectiveSystemPrompt });
-      }
-
-      messages.push(...normalizedHistory);
-      if (typeof currentMessage === 'string' && currentMessage.trim()) {
-        const latest = normalizedHistory[normalizedHistory.length - 1];
-        const currentText = currentMessage.trim();
-        const isDuplicate = latest && latest.role === 'user' && latest.content === currentText;
-        if (!isDuplicate) {
-          messages.push({ role: 'user', content: currentText });
-        }
-      }
-
-      return messages;
-    };
-
-    const callGeneralOllama = async (messages) => {
-      const response = await fetch('http://localhost:11434/api/chat', {
+    } else {
+      // general chat
+      const genResponse = await fetch(`${OLLAMA_URL}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: 'llama3.2',
-          messages,
+          messages: [{ role: 'system', content: 'You are SteelAI, a friendly AI assistant for a Power Plant Dashboard. Keep responses short and helpful.' }, { role: 'user', content: message }],
           stream: false,
         }),
       });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('❌ Ollama request failed:', response.status, errorText);
-        throw new Error('Ollama unavailable');
-      }
-
-      const data = await response.json();
-      const text = typeof data?.message?.content === 'string' ? data.message.content.trim() : '';
-      if (!text) {
-        console.error('❌ Ollama returned empty response');
-        throw new Error('Empty Ollama response');
-      }
-      return text;
-    };
-
-    const directMemoryReply = getDirectMemoryReply(message, rawMessages.length ? rawMessages : history);
-    if (directMemoryReply) {
-      console.log('🧠 Direct memory reply triggered');
-      return res.type('text/plain').send(directMemoryReply);
+      const genData = await genResponse.json();
+      return res.type('text/plain').send(genData.message.content.trim());
     }
-
-    if (isDashboardQuery) {
-      console.log('🔄 Dashboard query detected; searching PostgreSQL for relevant rows');
-      const relevantRows = await getRelevantRows(message);
-      if (relevantRows.length) {
-        console.log(`   Found ${relevantRows.length} relevant PostgreSQL rows for context`);
-        const contextText = relevantRows.map((row, index) => {
-          const readableDate = formatReadableDate(row.date);
-          return `${index + 1}. Date: ${readableDate} | Movement type: ${row.movementType} | Quantity: ${row.quantity} | Plant: ${row.plantName || 'unknown'} | City: ${row.city || 'unknown'} | Material: ${row.material || 'unknown'}`;
-        }).join('\n');
-
-        const systemPrompt = `You are a factual assistant. The conversation messages below are your memory. Treat them as the complete conversation history and use them to answer follow-up questions accurately. Never say you cannot remember previous messages when they are present in the provided history. Keep replies brief, natural, and directly focused on the user's request. Answer ONLY using the PostgreSQL rows provided below. Do not use outside knowledge. If the requested information is not present in the provided rows, reply with the best possible answer based on the data provided.\n\nDatabase rows:\n${contextText}\n\nAnswer in one short sentence.`;
-        const conversationMessages = buildConversationMessages(rawMessages.length ? rawMessages : history, message, systemPrompt);
-
-        console.log('   🤖 Calling Ollama for dashboard answer with SQL context');
-        const responseText = await callGeneralOllama(conversationMessages);
-        console.log('✅ [OLLAMA RESPONSE] Received dashboard answer from Ollama');
-        return res.type('text/plain').send(responseText);
-      }
-
-      console.log('🔁 No relevant PostgreSQL data found for dashboard query; falling back to general Ollama knowledge');
-    }
-
-    console.log('🔄 Delegating to Ollama for general knowledge response');
-    const generalSystemPrompt = 'You are a helpful assistant. The conversation messages below are your memory. Treat them as the complete conversation history and use them to answer follow-up questions accurately and concisely. Never say you cannot remember previous messages when they are present in the provided history. Keep replies brief, natural, and directly focused on the user ask.';
-    const generalMessages = buildConversationMessages(rawMessages.length ? rawMessages : history, message, generalSystemPrompt);
-    const generalText = await callGeneralOllama(generalMessages);
-    console.log('✅ [OLLAMA RESPONSE] Received general answer from Ollama');
-    return res.type('text/plain').send(generalText);
   } catch (error) {
-    console.error('❌ Chat handler failure:', error.message);
-    return res.status(503).json({ error: 'Ollama is not available. Please make sure Ollama is running.' });
+    console.error('❌ Chat handler failure:', error.message, error.stack);
+    return res.status(503).json({ error: `Ollama is not available. Please make sure Ollama is running. (Internal error: ${error.message})` });
   }
 });
 
